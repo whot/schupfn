@@ -1,0 +1,304 @@
+.TH SCHUPFN 1 "2026-04-22" "schupfn 0.1.0"
+.SH NAME
+schupfn \- run toolbox containers in virtual machines
+.SH SYNOPSIS
+.B schupfn enter
+.RI [ name ]
+.RI [ options ]
+.br
+.B schupfn list
+.br
+.B schupfn clean
+.RI [ name ]
+.SH DESCRIPTION
+.B schupfn
+boots a toolbox container as a virtual machine using
+.BR virtme\-ng (1).
+The current working directory is mounted read\-write inside the VM at
+the same path; everything else on the host is inaccessible.
+.PP
+The intended use is sandboxing: the VM boundary provides stronger
+isolation than a container, which matters when running untrusted code
+or AI agents that might try to break out of their sandbox.
+.PP
+The workflow is:
+.IP 1. 4
+Create and configure a toolbox container the usual way
+.RI ( "toolbox create" ,
+.IR "toolbox run" ).
+.IP 2.
+Run
+.B schupfn enter
+to export the container's filesystem, boot it as a VM with the host
+kernel, and SSH in.
+.IP 3.
+Work inside the VM as you would inside
+.BR toolbox (1).
+When you exit, the VM shuts down.
+.SH COMMANDS
+.SS enter \fR[\fIname\fR] [\fIoptions\fR]
+Export the toolbox container
+.I name
+to a local rootfs and boot it as a VM.
+If
+.I name
+is omitted, the
+.B container
+field from the configuration file is used (see
+.BR "CONFIGURATION FILE" ).
+.PP
+The container must have these packages installed:
+.BR openssh\-server ,
+.BR systemd\-udev ,
+.BR busybox .
+If any are missing,
+.B schupfn
+will offer to install them.
+.PP
+The options are as follows:
+.TP
+.BI \-\-export\-ro " path"
+Make an additional host path available in the VM.
+If
+.I path
+is a directory (or a symlink to one), it is mounted read\-only at
+its original absolute path.
+If
+.I path
+is a file (or a symlink to one), it is copied into the VM at its
+original absolute path (directory structure is preserved).
+This option may be given multiple times.
+.TP
+.BI \-\-export\-rw " path"
+Like
+.B \-\-export\-ro
+but directories are mounted read\-write.
+This option may be given multiple times.
+.TP
+.BI \-\-command " cmd"
+Run
+.I cmd
+in the VM instead of starting an interactive shell.
+The exit code of
+.I cmd
+is propagated as the exit code of
+.BR schupfn .
+.TP
+.BI \-\-config " path"
+Load the configuration file from
+.I path
+instead of searching for
+.B .schupfn/config.yml
+in parent directories.
+It is an error if the file does not exist.
+.TP
+.B \-\-refresh
+Force re\-export of the rootfs, even if the cached copy appears fresh.
+.TP
+.B \-\-deep\-check
+Use
+.B podman diff
+for more thorough staleness detection when deciding whether to
+re\-export.
+.TP
+.BI \-\-memory " size"
+Amount of memory for the VM, e.g.\&
+.BR 4G ,
+.BR 512M .
+The default is
+.BR 4G .
+.TP
+.BI \-\-cpus " n"
+Number of CPUs for the VM.
+Defaults to the host CPU count.
+.TP
+.B \-\-no\-network
+Disable the extra user\-mode network device.
+The internal SSH network device is unaffected.
+.TP
+.B \-\-verbose
+Show VM boot output on stderr.
+.SS list
+Show cached rootfs entries with their freshness status, size, and
+export date.
+Freshness is one of:
+.TP
+.B fresh
+The cached rootfs matches the current container state.
+.TP
+.B stale
+The container has changed since the rootfs was exported.
+.TP
+.B orphaned
+The container no longer exists.
+.SS clean \fR[\fIname\fR]
+Remove cached rootfs entries.
+If
+.I name
+is given, only that entry is removed.
+Otherwise all entries are removed after confirmation.
+.SH CONFIGURATION FILE
+.B schupfn
+searches from
+.B $PWD
+upward for a file named
+.BR .schupfn/config.yml .
+The first one found is loaded.
+Requires
+.BR yq (1)
+to be installed; if no configuration file is found,
+.B yq
+is not needed.
+.PP
+CLI arguments always take precedence over configuration file values.
+For
+.B \-\-export\-ro
+and
+.BR \-\-export\-rw ,
+the configuration file list and CLI list are merged (config entries
+first).
+.PP
+The following keys are recognised:
+.TP
+.B container
+.RI ( string )
+Default container name, used when none is given on the command line.
+.TP
+.B command
+.RI ( string )
+Command to run in the VM instead of an interactive shell.
+Same as
+.BR \-\-command .
+.TP
+.B export\-ro
+.RI ( "list of paths" )
+Paths to export read\-only into the VM.
+Same as
+.BR \-\-export\-ro .
+.TP
+.B export\-rw
+.RI ( "list of paths" )
+Paths to export read\-write into the VM.
+Same as
+.BR \-\-export\-rw .
+.TP
+.B vm.memory
+.RI ( string )
+VM memory.
+Same as
+.BR \-\-memory .
+.TP
+.B vm.cpus
+.RI ( int )
+VM CPU count.
+Same as
+.BR \-\-cpus .
+.TP
+.B vm.network
+.RI ( bool )
+Set to
+.B false
+to disable the extra network device.
+Same as
+.BR \-\-no\-network .
+.TP
+.B ssh_key
+.RI ( path )
+SSH private key to use when connecting to the VM.
+The path is validated at startup; a missing file is a fatal error.
+.SS Example
+.PP
+.in +4n
+.EX
+container: my\-toolbox
+command: make test
+
+export\-ro:
+  \- ~/src/shared\-lib
+  \- ~/.zshrc
+
+export\-rw:
+  \- ~/src/work\-in\-progress
+
+vm:
+  memory: 8G
+  cpus: 4
+  network: false
+
+ssh_key: ~/.ssh/id_ed25519
+.EE
+.in
+.SH ENVIRONMENT
+.TP
+.B XDG_CACHE_HOME
+Base directory for cached rootfs trees.
+Defaults to
+.IR ~/.cache .
+The cache lives under
+.IR $XDG_CACHE_HOME/schupfn/roots/ .
+.SH FILES
+.TP
+.I .schupfn/config.yml
+Per\-project configuration file, searched from
+.B $PWD
+upward.
+.TP
+.I ~/.cache/schupfn/roots/<name>/
+Cached rootfs for a container.
+Managed by
+.B schupfn list
+and
+.BR "schupfn clean" .
+.SH EXIT STATUS
+In interactive mode (no
+.BR \-\-command ),
+.B schupfn
+exits 0 on success.
+Non\-zero SSH exit codes produce a warning but
+.B schupfn
+still exits 0.
+.PP
+With
+.BR \-\-command ,
+the exit code of the remote command is forwarded as the exit code of
+.BR schupfn .
+.SH EXAMPLES
+Enter a toolbox as a VM:
+.PP
+.in +4n
+.EX
+schupfn enter mybox
+.EE
+.in
+.PP
+Mount extra directories and copy dotfiles:
+.PP
+.in +4n
+.EX
+schupfn enter mybox \-\-export\-ro ~/src/lib \-\-export\-ro ~/.vimrc
+.EE
+.in
+.PP
+Run a single command and exit:
+.PP
+.in +4n
+.EX
+schupfn enter mybox \-\-command "make -j$(nproc) test"
+.EE
+.in
+.PP
+Use a config file so you only need to type:
+.PP
+.in +4n
+.EX
+schupfn enter
+.EE
+.in
+.SH SEE ALSO
+.BR toolbox (1),
+.BR podman (1),
+.BR vng (1),
+.BR ssh (1),
+.BR yq (1)
+.SH LICENSE
+Apache\-2.0
