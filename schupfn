@@ -1004,6 +1004,7 @@ cmd_enter() {
         # extract at / in the VM to reconstruct the absolute path.
         local -a tar_paths=()
         for df in "${dotfiles[@]}"; do
+            info "copying file: $df"
             tar_paths+=("${df#/}")
         done
 
