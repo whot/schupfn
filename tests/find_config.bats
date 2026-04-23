@@ -5,6 +5,9 @@ load test_helper
 setup() {
     reset_die
     TMPDIR="$(make_tmpdir)"
+    # Prevent the XDG fallback from finding a real config on the host.
+    # Tests that exercise the XDG path set this to their own value.
+    export XDG_CONFIG_HOME="$TMPDIR/xdg-config-none"
 }
 
 teardown() {
@@ -83,4 +86,47 @@ teardown() {
     run find_config_file "/"
     # status is 0 or 1, either is fine, just shouldn't hang
     [[ "$status" -eq 0 || "$status" -eq 1 ]]
+}
+
+# ── XDG_CONFIG_HOME fallback tests ──────────────────────────────────────────
+
+@test "find_config_file: falls back to XDG_CONFIG_HOME/schupfn/default-config.yml" {
+    mkdir -p "$TMPDIR/xdg-config/schupfn"
+    echo "container: default" > "$TMPDIR/xdg-config/schupfn/default-config.yml"
+    mkdir -p "$TMPDIR/project"
+
+    XDG_CONFIG_HOME="$TMPDIR/xdg-config" run find_config_file "$TMPDIR/project"
+    [ "$status" -eq 0 ]
+    [ "$output" = "$TMPDIR/xdg-config/schupfn/default-config.yml" ]
+}
+
+@test "find_config_file: local config takes precedence over XDG fallback" {
+    mkdir -p "$TMPDIR/xdg-config/schupfn"
+    echo "container: default" > "$TMPDIR/xdg-config/schupfn/default-config.yml"
+    mkdir -p "$TMPDIR/project/.schupfn"
+    echo "container: local" > "$TMPDIR/project/.schupfn/config.yml"
+
+    XDG_CONFIG_HOME="$TMPDIR/xdg-config" run find_config_file "$TMPDIR/project"
+    [ "$status" -eq 0 ]
+    [ "$output" = "$TMPDIR/project/.schupfn/config.yml" ]
+}
+
+@test "find_config_file: returns 1 when no local config and no XDG fallback" {
+    mkdir -p "$TMPDIR/project"
+
+    XDG_CONFIG_HOME="$TMPDIR/nonexistent" run find_config_file "$TMPDIR/project"
+    [ "$status" -eq 1 ]
+    [ -z "$output" ]
+}
+
+@test "find_config_file: falls back to ~/.config when XDG_CONFIG_HOME is unset" {
+    # Use a fake HOME to avoid interfering with the real one
+    local fake_home="$TMPDIR/fakehome"
+    mkdir -p "$fake_home/.config/schupfn"
+    echo "container: home-default" > "$fake_home/.config/schupfn/default-config.yml"
+    mkdir -p "$TMPDIR/project"
+
+    HOME="$fake_home" XDG_CONFIG_HOME="" run find_config_file "$TMPDIR/project"
+    [ "$status" -eq 0 ]
+    [ "$output" = "$fake_home/.config/schupfn/default-config.yml" ]
 }

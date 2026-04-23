@@ -144,6 +144,16 @@ searches from
 upward for a file named
 .BR .schupfn/config.yml .
 The first one found is loaded.
+If no local config file is found,
+.B schupfn
+falls back to
+.IR $XDG_CONFIG_HOME/schupfn/default\-config.yml
+(defaulting to
+.IR ~/.config/schupfn/default\-config.yml
+if
+.B XDG_CONFIG_HOME
+is unset).
+.PP
 Requires
 .BR yq (1)
 to be installed; if no configuration file is found,
@@ -230,6 +240,13 @@ ssh_key: ~/.ssh/id_ed25519
 .in
 .SH ENVIRONMENT
 .TP
+.B XDG_CONFIG_HOME
+Base directory for the user\-level default configuration file.
+Defaults to
+.IR ~/.config .
+The fallback config file is
+.IR $XDG_CONFIG_HOME/schupfn/default\-config.yml .
+.TP
 .B XDG_CACHE_HOME
 Base directory for cached rootfs trees.
 Defaults to
@@ -242,6 +259,13 @@ The cache lives under
 Per\-project configuration file, searched from
 .B $PWD
 upward.
+.TP
+.I $XDG_CONFIG_HOME/schupfn/default\-config.yml
+User\-level default configuration file, used when no local
+.I .schupfn/config.yml
+is found.
+Defaults to
+.IR ~/.config/schupfn/default\-config.yml .
 .TP
 .I ~/.cache/schupfn/roots/<name>/
 Cached rootfs for a container.

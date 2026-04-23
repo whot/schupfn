@@ -257,6 +257,8 @@ cleanup_vm() {
 # ── Configuration file ───────────────────────────────────────────────────────
 
 # Walk from the given directory up to / looking for .schupfn/config.yml.
+# If none is found, fall back to $XDG_CONFIG_HOME/schupfn/default-config.yml
+# (defaulting to ~/.config if XDG_CONFIG_HOME is unset).
 # Prints the path of the first one found, or nothing if none exists.
 find_config_file() {
     local dir="$1"
@@ -271,6 +273,14 @@ find_config_file() {
         fi
         dir="$(dirname "$dir")"
     done
+
+    # Fall back to the user-level default config
+    local xdg_candidate="${XDG_CONFIG_HOME:-$HOME/.config}/schupfn/default-config.yml"
+    if [ -f "$xdg_candidate" ]; then
+        echo "$xdg_candidate"
+        return 0
+    fi
+
     return 1
 }
 
@@ -825,7 +835,8 @@ cmd_enter() {
     done
 
     # Load configuration file (if any). --config overrides the default
-    # search; otherwise walk from $PWD upward for .schupfn/config.yml.
+    # search; otherwise walk from $PWD upward for .schupfn/config.yml,
+    # falling back to $XDG_CONFIG_HOME/schupfn/default-config.yml.
     # Config values provide defaults; CLI arguments always take precedence.
     local -a _cfg_exports=()
     local -a _cfg_exports_rw=()
