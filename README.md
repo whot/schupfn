@@ -79,11 +79,20 @@ one pointing to a file is copied.
 
 Both flags are repeatable, pass them as many times as you like.
 
-## Configuration file
+## Configuration files
 
-Instead of typing export flags every time, you can drop a config file
-at `.schupfn/config.yml` in or above your working directory. schupfn
-walks from `$PWD` upward and uses the first one it finds.
+schupfn supports multiple configuration files, in order of preference:
+- `.schupfn/config.yml` for directory-local configuration. schupfn will walk
+   up from `$PWD` and use the first one it finds.
+- `$XDG_CONFIG_HOME/schupfn/<containername>-config.yml` for container-wide
+  configuration. Use this when the same container is used across multiple
+  projects. For example you may have a `gnome` toolbox for building the
+  gnome stack and want to export the whole of gnome's source tree.
+- `$XDG_CONFIG_HOME/schupfn/default-config.yml` as the fallback config
+  if no other one is found. Use this as a fallback for paths you always need,
+  e.g. shell setup.
+
+The supported keys in the configuration file are:
 
 ```yaml
 container: my-toolbox

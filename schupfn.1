@@ -147,12 +147,15 @@ The first one found is loaded.
 If no local config file is found,
 .B schupfn
 falls back to
-.IR $XDG_CONFIG_HOME/schupfn/default\-config.yml
-(defaulting to
-.IR ~/.config/schupfn/default\-config.yml
-if
+.IR $XDG_CONFIG_HOME/schupfn/ :
+first
+.IR <container>\-config.yml
+(if the container name is known from the command line), then
+.IR default\-config.yml .
 .B XDG_CONFIG_HOME
-is unset).
+defaults to
+.IR ~/.config
+if unset.
 .PP
 Requires
 .BR yq (1)
@@ -241,10 +244,16 @@ ssh_key: ~/.ssh/id_ed25519
 .SH ENVIRONMENT
 .TP
 .B XDG_CONFIG_HOME
-Base directory for the user\-level default configuration file.
+Base directory for user\-level configuration files.
 Defaults to
 .IR ~/.config .
-The fallback config file is
+When no local
+.I .schupfn/config.yml
+is found,
+.B schupfn
+looks for
+.IR $XDG_CONFIG_HOME/schupfn/<container>\-config.yml ,
+then
 .IR $XDG_CONFIG_HOME/schupfn/default\-config.yml .
 .TP
 .B XDG_CACHE_HOME
@@ -260,10 +269,15 @@ Per\-project configuration file, searched from
 .B $PWD
 upward.
 .TP
+.I $XDG_CONFIG_HOME/schupfn/<container>\-config.yml
+Container\-specific user\-level configuration file, used when no local
+.I .schupfn/config.yml
+is found and the container name is known from the command line.
+.TP
 .I $XDG_CONFIG_HOME/schupfn/default\-config.yml
 User\-level default configuration file, used when no local
 .I .schupfn/config.yml
-is found.
+or container\-specific config is found.
 Defaults to
 .IR ~/.config/schupfn/default\-config.yml .
 .TP

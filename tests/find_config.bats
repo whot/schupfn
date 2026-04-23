@@ -130,3 +130,67 @@ teardown() {
     [ "$status" -eq 0 ]
     [ "$output" = "$fake_home/.config/schupfn/default-config.yml" ]
 }
+
+# ── Container-specific XDG config tests ─────────────────────────────────────
+
+@test "find_config_file: uses container-specific XDG config when available" {
+    mkdir -p "$TMPDIR/xdg-config/schupfn"
+    echo "container: mybox" > "$TMPDIR/xdg-config/schupfn/mybox-config.yml"
+    echo "container: default" > "$TMPDIR/xdg-config/schupfn/default-config.yml"
+    mkdir -p "$TMPDIR/project"
+
+    XDG_CONFIG_HOME="$TMPDIR/xdg-config" run find_config_file "$TMPDIR/project" "mybox"
+    [ "$status" -eq 0 ]
+    [ "$output" = "$TMPDIR/xdg-config/schupfn/mybox-config.yml" ]
+}
+
+@test "find_config_file: falls back to default-config.yml when container-specific config missing" {
+    mkdir -p "$TMPDIR/xdg-config/schupfn"
+    echo "container: default" > "$TMPDIR/xdg-config/schupfn/default-config.yml"
+    mkdir -p "$TMPDIR/project"
+
+    XDG_CONFIG_HOME="$TMPDIR/xdg-config" run find_config_file "$TMPDIR/project" "mybox"
+    [ "$status" -eq 0 ]
+    [ "$output" = "$TMPDIR/xdg-config/schupfn/default-config.yml" ]
+}
+
+@test "find_config_file: container-specific config without default-config.yml" {
+    mkdir -p "$TMPDIR/xdg-config/schupfn"
+    echo "container: mybox" > "$TMPDIR/xdg-config/schupfn/mybox-config.yml"
+    mkdir -p "$TMPDIR/project"
+
+    XDG_CONFIG_HOME="$TMPDIR/xdg-config" run find_config_file "$TMPDIR/project" "mybox"
+    [ "$status" -eq 0 ]
+    [ "$output" = "$TMPDIR/xdg-config/schupfn/mybox-config.yml" ]
+}
+
+@test "find_config_file: local config takes precedence over container-specific XDG config" {
+    mkdir -p "$TMPDIR/xdg-config/schupfn"
+    echo "container: mybox" > "$TMPDIR/xdg-config/schupfn/mybox-config.yml"
+    mkdir -p "$TMPDIR/project/.schupfn"
+    echo "container: local" > "$TMPDIR/project/.schupfn/config.yml"
+
+    XDG_CONFIG_HOME="$TMPDIR/xdg-config" run find_config_file "$TMPDIR/project" "mybox"
+    [ "$status" -eq 0 ]
+    [ "$output" = "$TMPDIR/project/.schupfn/config.yml" ]
+}
+
+@test "find_config_file: empty container name skips container-specific lookup" {
+    mkdir -p "$TMPDIR/xdg-config/schupfn"
+    echo "container: default" > "$TMPDIR/xdg-config/schupfn/default-config.yml"
+    # This file should never match with an empty name
+    echo "container: empty" > "$TMPDIR/xdg-config/schupfn/-config.yml"
+    mkdir -p "$TMPDIR/project"
+
+    XDG_CONFIG_HOME="$TMPDIR/xdg-config" run find_config_file "$TMPDIR/project" ""
+    [ "$status" -eq 0 ]
+    [ "$output" = "$TMPDIR/xdg-config/schupfn/default-config.yml" ]
+}
+
+@test "find_config_file: returns 1 when no local, no container-specific, no default" {
+    mkdir -p "$TMPDIR/project"
+
+    XDG_CONFIG_HOME="$TMPDIR/nonexistent" run find_config_file "$TMPDIR/project" "mybox"
+    [ "$status" -eq 1 ]
+    [ -z "$output" ]
+}

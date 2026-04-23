@@ -257,11 +257,15 @@ cleanup_vm() {
 # ── Configuration file ───────────────────────────────────────────────────────
 
 # Walk from the given directory up to / looking for .schupfn/config.yml.
-# If none is found, fall back to $XDG_CONFIG_HOME/schupfn/default-config.yml
-# (defaulting to ~/.config if XDG_CONFIG_HOME is unset).
-# Prints the path of the first one found, or nothing if none exists.
+# If none is found, fall back to XDG_CONFIG_HOME/schupfn/ — first trying
+# <container>-config.yml (when a container name is given), then
+# default-config.yml.  XDG_CONFIG_HOME defaults to ~/.config.
+# Prints the path of the first config found, or nothing if none exists.
+#
+# Usage: find_config_file <start-dir> [container-name]
 find_config_file() {
     local dir="$1"
+    local container="${2:-}"
     while true; do
         local candidate="$dir/.schupfn/config.yml"
         if [ -f "$candidate" ]; then
@@ -274,10 +278,22 @@ find_config_file() {
         dir="$(dirname "$dir")"
     done
 
-    # Fall back to the user-level default config
-    local xdg_candidate="${XDG_CONFIG_HOME:-$HOME/.config}/schupfn/default-config.yml"
-    if [ -f "$xdg_candidate" ]; then
-        echo "$xdg_candidate"
+    # Fall back to user-level config under XDG_CONFIG_HOME
+    local xdg_dir="${XDG_CONFIG_HOME:-$HOME/.config}/schupfn"
+
+    # Try container-specific config first
+    if [ -n "$container" ]; then
+        local xdg_container="$xdg_dir/${container}-config.yml"
+        if [ -f "$xdg_container" ]; then
+            echo "$xdg_container"
+            return 0
+        fi
+    fi
+
+    # Then try the default config
+    local xdg_default="$xdg_dir/default-config.yml"
+    if [ -f "$xdg_default" ]; then
+        echo "$xdg_default"
         return 0
     fi
 
@@ -836,7 +852,8 @@ cmd_enter() {
 
     # Load configuration file (if any). --config overrides the default
     # search; otherwise walk from $PWD upward for .schupfn/config.yml,
-    # falling back to $XDG_CONFIG_HOME/schupfn/default-config.yml.
+    # falling back to $XDG_CONFIG_HOME/schupfn/<name>-config.yml (if the
+    # container name is known from the CLI), then default-config.yml.
     # Config values provide defaults; CLI arguments always take precedence.
     local -a _cfg_exports=()
     local -a _cfg_exports_rw=()
@@ -849,7 +866,7 @@ cmd_enter() {
         config_file="$cli_config"
         info "using config: $config_file"
         load_config "$config_file"
-    elif config_file=$(find_config_file "$PWD"); then
+    elif config_file=$(find_config_file "$PWD" "$name"); then
         info "using config: $config_file"
         load_config "$config_file"
     fi
