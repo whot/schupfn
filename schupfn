@@ -209,20 +209,46 @@ wait_for_ssh() {
     die "timed out waiting for SSH (${timeout}s). VM may have failed to boot."
 }
 
+# Collect all PIDs in the process tree rooted at $1 (depth-first).
+_pstree_pids() {
+    local pid="$1"
+    local children
+    children=$(ps -o pid= --ppid "$pid" 2>/dev/null) || true
+    for child in $children; do
+        _pstree_pids "$child"
+    done
+    echo "$pid"
+}
+
 # Clean up the background VM process. Called via trap on EXIT.
+# vng spawns a shell which spawns qemu, so we must kill the entire
+# process tree — not just the top-level PID — to avoid orphaned
+# qemu instances.
 cleanup_vm() {
     if [ -n "${VNG_PID:-}" ] && kill -0 "$VNG_PID" 2>/dev/null; then
         info "shutting down VM (pid $VNG_PID)..."
-        kill "$VNG_PID" 2>/dev/null
-        # Give it a moment to shut down gracefully
+        # Collect the full process tree (children before parents)
+        local -a pids
+        mapfile -t pids < <(_pstree_pids "$VNG_PID")
+
+        # Graceful SIGTERM to the whole tree
+        for pid in "${pids[@]}"; do
+            kill "$pid" 2>/dev/null
+        done
+
+        # Give them a moment to shut down
         local i=0
         while kill -0 "$VNG_PID" 2>/dev/null && [ "$i" -lt 5 ]; do
             sleep 1
             i=$((i + 1))
         done
-        # Force kill if still alive
+
+        # Force kill any survivors
         if kill -0 "$VNG_PID" 2>/dev/null; then
-            kill -9 "$VNG_PID" 2>/dev/null
+            mapfile -t pids < <(_pstree_pids "$VNG_PID")
+            for pid in "${pids[@]}"; do
+                kill -9 "$pid" 2>/dev/null
+            done
         fi
         wait "$VNG_PID" 2>/dev/null
     fi
