@@ -1018,6 +1018,10 @@ cmd_enter() {
     # the init script reads virtme_chdir and does cd to it.
     vng_cmd+=(--append "virtme_chdir=$PWD")
 
+    # Tag the VM so processes inside can identify it as schupfn-started.
+    # Readable via: grep -o 'schupfn.container=[^ ]*' /proc/cmdline
+    vng_cmd+=(--append "schupfn.container=$name")
+
     # Pick a port for SSH and enable the SSH server inside the VM.
     # Use --ssh-tcp because the VM kernel typically lacks the vsock module.
     local ssh_port
