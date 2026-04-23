@@ -90,10 +90,13 @@ classify_export() {
             rootfs_symlinks+=("$abs_dir:$resolved")
         fi
     else
-        # Regular file (or symlink to a file): resolve to absolute path
-        local resolved
-        resolved="$(realpath "$path")"
-        dotfiles+=("$resolved")
+        # Regular file (or symlink to a file): use the absolute path of
+        # the link itself (not its target) so the file is placed at the
+        # original path inside the VM.  tar -h dereferences the symlink
+        # at copy time.
+        local abs_file
+        abs_file="$(cd "$(dirname "$path")" && echo "$PWD/$(basename "$path")")"
+        dotfiles+=("$abs_file")
     fi
 }
 
