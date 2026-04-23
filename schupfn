@@ -294,6 +294,16 @@ load_config() {
         die "failed to parse config file: $config_file"
     fi
 
+    # Warn about unrecognised keys
+    local _known_keys=" container command export-ro export-rw vm vm.memory vm.cpus vm.network ssh_key "
+    local _key
+    while IFS= read -r _key; do
+        [ -z "$_key" ] && continue
+        if [[ "$_known_keys" != *" $_key "* ]]; then
+            warn "unknown config key '$_key' in $config_file"
+        fi
+    done < <(yq '[.. | path | map(select(tag != "!!int")) | join(".")] | unique | .[]' "$config_file")
+
     # container: default container name
     _cfg_container=$(yq -r '.container // ""' "$config_file")
 

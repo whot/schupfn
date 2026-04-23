@@ -17,10 +17,17 @@ die() {
     return 1
 }
 
+# Override warn() so tests can assert on warnings.
+# Appends each warning to the _warn_messages array.
+warn() {
+    _warn_messages+=("$*")
+}
+
 # Reset die tracking state. Call in setup().
 reset_die() {
     _die_called=0
     _die_message=""
+    _warn_messages=()
 }
 
 # Assert that die() was called with a message matching the given pattern.
@@ -42,6 +49,27 @@ assert_die_called() {
 assert_die_not_called() {
     if [ "$_die_called" = "1" ]; then
         echo "die() was called unexpectedly: $_die_message" >&2
+        return 1
+    fi
+}
+
+# Assert that warn() was called with a message matching the given pattern.
+assert_warned() {
+    local pattern="${1:-}"
+    local msg
+    for msg in "${_warn_messages[@]}"; do
+        if [[ "$msg" == *"$pattern"* ]]; then
+            return 0
+        fi
+    done
+    echo "expected a warning matching '$pattern', got: ${_warn_messages[*]:-<none>}" >&2
+    return 1
+}
+
+# Assert that warn() was never called.
+assert_no_warnings() {
+    if [ "${#_warn_messages[@]}" -gt 0 ]; then
+        echo "unexpected warnings: ${_warn_messages[*]}" >&2
         return 1
     fi
 }

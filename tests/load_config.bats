@@ -212,3 +212,61 @@ EOF
     load_config "$TMPDIR/config.yml"
     [ "$_cfg_ssh_key" = "$TMPDIR/mykey" ]
 }
+
+@test "load_config: warns on unknown top-level key" {
+    yq_or_skip
+    cat > "$TMPDIR/config.yml" <<'EOF'
+container: my-toolbox
+bogus: hello
+EOF
+    load_config "$TMPDIR/config.yml"
+    assert_warned "unknown config key 'bogus'"
+}
+
+@test "load_config: warns on unknown nested vm key" {
+    yq_or_skip
+    cat > "$TMPDIR/config.yml" <<'EOF'
+vm:
+  memory: 4G
+  disks: 2
+EOF
+    load_config "$TMPDIR/config.yml"
+    assert_warned "unknown config key 'vm.disks'"
+}
+
+@test "load_config: warns on multiple unknown keys" {
+    yq_or_skip
+    cat > "$TMPDIR/config.yml" <<'EOF'
+contaner: typo
+vm:
+  memorry: 8G
+EOF
+    load_config "$TMPDIR/config.yml"
+    assert_warned "unknown config key 'contaner'"
+    assert_warned "unknown config key 'vm.memorry'"
+}
+
+@test "load_config: no warnings for valid config" {
+    yq_or_skip
+    cat > "$TMPDIR/config.yml" <<'EOF'
+container: my-toolbox
+command: make test
+export-ro:
+  - /tmp/aaa
+export-rw:
+  - /tmp/bbb
+vm:
+  memory: 4G
+  cpus: 2
+  network: false
+EOF
+    load_config "$TMPDIR/config.yml"
+    assert_no_warnings
+}
+
+@test "load_config: no warnings for empty config" {
+    yq_or_skip
+    touch "$TMPDIR/config.yml"
+    load_config "$TMPDIR/config.yml"
+    assert_no_warnings
+}
