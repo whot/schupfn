@@ -971,6 +971,7 @@ cmd_enter() {
         --force-9p
         --no-virtme-ng-init
         --memory "$memory"
+        --name "$name"
     )
 
     if [ -n "$cpus" ]; then
