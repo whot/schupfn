@@ -274,12 +274,20 @@ load_config() {
     # export-ro: list of paths (read-only)
     local line
     while IFS= read -r line; do
-        [ -n "$line" ] && _cfg_exports+=("$line")
+        if [ -n "$line" ]; then
+            # Treat relative paths as relative to $HOME
+            [[ "$line" != /* && "$line" != ~* ]] && line="$HOME/$line"
+            _cfg_exports+=("$line")
+        fi
     done < <(yq -r '.["export-ro"] // [] | .[]' "$config_file")
 
     # export-rw: list of paths (read-write)
     while IFS= read -r line; do
-        [ -n "$line" ] && _cfg_exports_rw+=("$line")
+        if [ -n "$line" ]; then
+            # Treat relative paths as relative to $HOME
+            [[ "$line" != /* && "$line" != ~* ]] && line="$HOME/$line"
+            _cfg_exports_rw+=("$line")
+        fi
     done < <(yq -r '.["export-rw"] // [] | .[]' "$config_file")
 
     # vm.memory
