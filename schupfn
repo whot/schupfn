@@ -275,7 +275,8 @@ find_config_file() {
         if [ "$dir" = "/" ]; then
             break
         fi
-        dir="$(dirname "$dir")"
+        dir="${dir%/*}"
+        [ -z "$dir" ] && dir="/"
     done
 
     # Fall back to user-level config under XDG_CONFIG_HOME
