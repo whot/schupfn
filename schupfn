@@ -316,68 +316,91 @@ load_config() {
 
     check_command yq
 
-    # Validate the file is parseable
-    if ! yq '.' "$config_file" >/dev/null 2>&1; then
-        die "failed to parse config file: $config_file"
-    fi
+    # Extract everything in a single yq invocation.  The output is a
+    # stream of sentinel-delimited sections that we parse in pure bash.
+    #
+    #   __SCALARS__
+    #   container=<value>
+    #   command=<value>
+    #   memory=<value>
+    #   cpus=<value>
+    #   network=<value>
+    #   ssh_key=<value>
+    #   __EXPORT_RO__
+    #   <path>          (one per line)
+    #   __EXPORT_RW__
+    #   <path>          (one per line)
+    #   __KEYS__
+    #   <dotted.key>    (one per line)
+    #
+    local blob
+    blob=$(yq -r '
+        "__SCALARS__",
+        "container=" + (.container // ""),
+        "command="   + (.command // ""),
+        "memory="    + (.vm.memory // ""),
+        "cpus="      + ((.vm.cpus // "") | tostring),
+        "network="   + (.vm.network | tostring),
+        "ssh_key="   + (.ssh_key // ""),
+        "__EXPORT_RO__",
+        (.["export-ro"] // [] | .[]),
+        "__EXPORT_RW__",
+        (.["export-rw"] // [] | .[]),
+        "__KEYS__",
+        ([.. | path | map(select(tag != "!!int")) | join(".")] | unique | .[])
+    ' "$config_file" 2>/dev/null) || die "failed to parse config file: $config_file"
 
-    # Warn about unrecognised keys
-    local _known_keys=" container command export-ro export-rw vm vm.memory vm.cpus vm.network ssh_key "
-    local _key
-    while IFS= read -r _key; do
-        [ -z "$_key" ] && continue
-        if [[ "$_known_keys" != *" $_key "* ]]; then
-            warn "unknown config key '$_key' in $config_file"
-        fi
-    done < <(yq '[.. | path | map(select(tag != "!!int")) | join(".")] | unique | .[]' "$config_file")
-
-    # container: default container name
-    _cfg_container=$(yq -r '.container // ""' "$config_file")
-
-    # command: command to run instead of a shell
-    _cfg_command=$(yq -r '.command // ""' "$config_file")
-
-    # export-ro: list of paths (read-only)
-    local line
+    # Parse the blob line by line — zero additional forks.
+    local section="" line
+    local raw_cpus="" raw_network="" raw_key=""
     while IFS= read -r line; do
-        if [ -n "$line" ]; then
-            # Treat relative paths as relative to $HOME
-            [[ "$line" != /* && "$line" != ~* ]] && line="$HOME/$line"
-            _cfg_exports+=("$line")
-        fi
-    done < <(yq -r '.["export-ro"] // [] | .[]' "$config_file")
+        case "$line" in
+            __SCALARS__|__EXPORT_RO__|__EXPORT_RW__|__KEYS__)
+                section="$line"; continue ;;
+        esac
 
-    # export-rw: list of paths (read-write)
-    while IFS= read -r line; do
-        if [ -n "$line" ]; then
-            # Treat relative paths as relative to $HOME
-            [[ "$line" != /* && "$line" != ~* ]] && line="$HOME/$line"
-            _cfg_exports_rw+=("$line")
-        fi
-    done < <(yq -r '.["export-rw"] // [] | .[]' "$config_file")
+        case "$section" in
+            __SCALARS__)
+                local key="${line%%=*}"
+                local val="${line#*=}"
+                case "$key" in
+                    container) _cfg_container="$val" ;;
+                    command)   _cfg_command="$val" ;;
+                    memory)    _cfg_memory="$val" ;;
+                    cpus)      raw_cpus="$val" ;;
+                    network)   raw_network="$val" ;;
+                    ssh_key)   raw_key="$val" ;;
+                esac
+                ;;
+            __EXPORT_RO__)
+                if [ -n "$line" ]; then
+                    [[ "$line" != /* && "$line" != ~* ]] && line="$HOME/$line"
+                    _cfg_exports+=("$line")
+                fi
+                ;;
+            __EXPORT_RW__)
+                if [ -n "$line" ]; then
+                    [[ "$line" != /* && "$line" != ~* ]] && line="$HOME/$line"
+                    _cfg_exports_rw+=("$line")
+                fi
+                ;;
+            __KEYS__)
+                [ -z "$line" ] && continue
+                local _known_keys=" container command export-ro export-rw vm vm.memory vm.cpus vm.network ssh_key "
+                if [[ "$_known_keys" != *" $line "* ]]; then
+                    warn "unknown config key '$line' in $config_file"
+                fi
+                ;;
+        esac
+    done <<< "$blob"
 
-    # vm.memory
-    _cfg_memory=$(yq -r '.vm.memory // ""' "$config_file")
-
-    # vm.cpus
-    local raw_cpus
-    raw_cpus=$(yq -r '.vm.cpus // ""' "$config_file")
     if [ -n "$raw_cpus" ]; then
         _cfg_cpus="$raw_cpus"
     fi
-
-    # vm.network (boolean, only override if explicitly false)
-    local raw_network
-    raw_network=$(yq -r '.vm.network' "$config_file")
     if [ "$raw_network" = "false" ]; then
         _cfg_network="0"
     fi
-
-    # ssh_key
-    local raw_key
-    raw_key=$(yq -r '.ssh_key // ""' "$config_file")
     if [ -n "$raw_key" ]; then
-        # Expand ~ in case it's in the value
         raw_key="${raw_key/#\~\//$HOME/}"
         if [ ! -f "$raw_key" ]; then
             die "ssh_key not found: $raw_key (from $config_file)"
