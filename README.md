@@ -152,6 +152,32 @@ Export the container and boot it as a VM.
 | `--no-network`       | Disable the extra network device (SSH still works)        |
 | `--verbose`          | Show VM boot output                                       |
 
+### `schupfn join [<name>] [options]`
+
+Open a new SSH session to an already-running VM. This allows multiple
+terminal sessions to share the same VM without starting a second one.
+
+If `<name>` is omitted and exactly one VM is running, that VM is joined
+automatically. If multiple VMs are running, an interactive menu is shown.
+
+```sh
+# In terminal 1:
+schupfn enter mybox
+
+# In terminal 2 -- join the same VM:
+schupfn join mybox
+
+# If only one VM is running, the name can be omitted:
+schupfn join
+
+# Run a command in a running VM:
+schupfn join mybox --command "make test"
+```
+
+| Option            | Description                                             |
+|-------------------|---------------------------------------------------------|
+| `--command <cmd>` | Run a command in the VM instead of an interactive shell  |
+
 ### `schupfn list`
 
 Show cached rootfs entries with their freshness status and size.

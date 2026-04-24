@@ -6,6 +6,10 @@ schupfn \- run toolbox containers in virtual machines
 .RI [ name ]
 .RI [ options ]
 .br
+.B schupfn join
+.RI [ name ]
+.RI [ options ]
+.br
 .B schupfn list
 .br
 .B schupfn clean
@@ -118,9 +122,35 @@ The internal SSH network device is unaffected.
 .TP
 .B \-\-verbose
 Show VM boot output on stderr.
+.SS join \fR[\fIname\fR] [\fIoptions\fR]
+Open a new SSH session to an already\-running VM.
+This allows multiple terminal sessions to share the same VM
+without starting a second one.
+.PP
+If
+.I name
+is omitted and exactly one VM is running, that VM is joined
+automatically.
+If multiple VMs are running, an interactive menu is presented.
+.PP
+Session state is tracked in
+.I $XDG_RUNTIME_DIR/schupfn/sessions/
+and cleaned up automatically when the VM exits or when stale
+sessions are detected.
+.PP
+The options are as follows:
+.TP
+.BI \-\-command " cmd"
+Run
+.I cmd
+in the VM instead of starting an interactive shell.
+The exit code of
+.I cmd
+is propagated as the exit code of
+.BR schupfn .
 .SS list
-Show cached rootfs entries with their freshness status, size, and
-export date.
+Show cached rootfs entries with their freshness status, number of
+running VMs, size, and export date.
 Freshness is one of:
 .TP
 .B fresh
@@ -262,6 +292,15 @@ Defaults to
 .IR ~/.cache .
 The cache lives under
 .IR $XDG_CACHE_HOME/schupfn/roots/ .
+.TP
+.B XDG_RUNTIME_DIR
+Base directory for runtime session files.
+Session files are stored in
+.IR $XDG_RUNTIME_DIR/schupfn/sessions/ .
+When this variable is not set, session tracking is disabled
+and the
+.B join
+command will not work.
 .SH FILES
 .TP
 .I .schupfn/config.yml
@@ -287,6 +326,15 @@ Managed by
 .B schupfn list
 and
 .BR "schupfn clean" .
+.TP
+.I $XDG_RUNTIME_DIR/schupfn/sessions/
+Runtime session files for active VMs.
+Each file records the SSH port, PID, and working directory of a
+running VM.
+Used by
+.B schupfn join
+to connect to existing VMs.
+Cleaned up automatically when VMs exit.
 .SH EXIT STATUS
 In interactive mode (no
 .BR \-\-command ),
@@ -322,6 +370,30 @@ Run a single command and exit:
 .in +4n
 .EX
 schupfn enter mybox \-\-command "make -j$(nproc) test"
+.EE
+.in
+.PP
+Join a running VM from another terminal:
+.PP
+.in +4n
+.EX
+schupfn join mybox
+.EE
+.in
+.PP
+Join the only running VM (name auto\-detected):
+.PP
+.in +4n
+.EX
+schupfn join
+.EE
+.in
+.PP
+Run a command in a running VM without an interactive shell:
+.PP
+.in +4n
+.EX
+schupfn join mybox \-\-command "make test"
 .EE
 .in
 .PP
