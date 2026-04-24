@@ -124,26 +124,23 @@ check_container_prerequisites() {
     local name="$1"
     local -a missing=()
 
-    # Mount the container's filesystem to check for required binaries.
-    # This inspects the actual container state (including packages installed
-    # via toolbox run), not just the base image.
-    local mnt
-    mnt=$(podman unshare podman mount "$name" 2>/dev/null)
-    if [ -z "$mnt" ]; then
-        die "failed to mount container '$name' for prerequisite check"
-    fi
+    # Mount the container, check all binaries, unmount — in a single
+    # podman unshare call.  Each podman unshare creates a user namespace
+    # so batching saves significant overhead (5 calls → 1).
+    local check_result
+    check_result=$(podman unshare bash -c '
+        mnt=$(podman mount "$1" 2>/dev/null) || exit 1
+        test -x "$mnt/usr/sbin/sshd" || echo openssh-server
+        test -x "$mnt/usr/lib/systemd/systemd-udevd" || \
+            test -x "$mnt/lib/systemd/systemd-udevd" || echo systemd-udev
+        test -x "$mnt/usr/bin/busybox" || \
+            test -x "$mnt/bin/busybox" || echo busybox
+        podman unmount "$1" >/dev/null 2>&1
+    ' _ "$name" 2>/dev/null) || die "failed to mount container '$name' for prerequisite check"
 
-    podman unshare test -x "$mnt/usr/sbin/sshd" || missing+=("openssh-server")
-
-    podman unshare bash -c "test -x '$mnt/usr/lib/systemd/systemd-udevd' || \
-                            test -x '$mnt/lib/systemd/systemd-udevd'" \
-        || missing+=("systemd-udev")
-
-    podman unshare bash -c "test -x '$mnt/usr/bin/busybox' || \
-                            test -x '$mnt/bin/busybox'" \
-        || missing+=("busybox")
-
-    podman unshare podman unmount "$name" >/dev/null 2>&1
+    while IFS= read -r pkg; do
+        [ -n "$pkg" ] && missing+=("$pkg")
+    done <<< "$check_result"
 
     if [ ${#missing[@]} -eq 0 ]; then
         return
