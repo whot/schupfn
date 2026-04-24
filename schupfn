@@ -640,26 +640,33 @@ install_vm_modules() {
 
     info "installing kernel modules ($kver) into rootfs"
 
-    # Copy virtio_net and its dependencies. Use podman unshare because
-    # the module directory may have restrictive permissions from the
-    # container's package installation.
+    # Copy virtio_net and its dependencies. Collect all source→dest
+    # pairs first, then do a single podman unshare call to copy them
+    # all (each podman unshare creates a user namespace, so batching
+    # saves significant overhead).
+    local -a mod_pairs=()
     while IFS= read -r line; do
-        local mod_path
-        mod_path=$(echo "$line" | sed 's/^insmod //;s/[[:space:]]*$//')
+        local mod_path="${line#insmod }"
+        mod_path="${mod_path%%[[:space:]]}"
         if [ -f "$mod_path" ]; then
             local rel_path="${mod_path#/lib/modules/$kver/}"
-            local dest_dir
-            dest_dir=$(dirname "$rootfs_moddir/$rel_path")
-            podman unshare mkdir -p "$dest_dir"
-            podman unshare cp "$mod_path" "$rootfs_moddir/$rel_path"
+            mod_pairs+=("$mod_path" "$rootfs_moddir/$rel_path")
         fi
     done < <(modprobe --show-depends virtio_net 2>/dev/null)
 
+    # Single podman unshare: create directories, copy modules, leave marker.
+    podman unshare bash -c '
+        rootfs_moddir="$1"; shift
+        while [ $# -ge 2 ]; do
+            mkdir -p "${2%/*}"
+            cp "$1" "$2"
+            shift 2
+        done
+        touch "$rootfs_moddir/.schupfn-modules"
+    ' _ "$rootfs_moddir" "${mod_pairs[@]}"
+
     # Generate modules.dep so modprobe can resolve dependencies
     depmod -a -b "$rootfs_dir" "$kver" 2>/dev/null
-
-    # Leave a marker so we don't redo this on the next run
-    podman unshare touch "$rootfs_moddir/.schupfn-modules"
 }
 
 # ── Export ───────────────────────────────────────────────────────────────────
