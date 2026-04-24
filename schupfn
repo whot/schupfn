@@ -565,9 +565,10 @@ check_freshness() {
 
     if [ "$deep_check" = "1" ]; then
         info "running deep check (podman diff) for '$name'..."
-        local diff_hash
-        diff_hash=$(podman diff "$name" 2>/dev/null | sha256sum | cut -d' ' -f1)
-        if [ $? -ne 0 ]; then
+        local diff_hash_raw
+        diff_hash_raw=$(podman diff "$name" 2>/dev/null | sha256sum)
+        local diff_hash="${diff_hash_raw%%[[:space:]]*}"
+        if [ -z "$diff_hash" ]; then
             warn "podman diff failed, treating rootfs as stale"
             return 1
         fi
