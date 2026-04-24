@@ -7,6 +7,11 @@
 PROGNAME="schupfn"
 VERSION="0.1.0"
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/schupfn/roots"
+if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
+    SESSION_DIR="$XDG_RUNTIME_DIR/schupfn/sessions"
+else
+    SESSION_DIR=""
+fi
 META_FILE=".schupfn-meta"
 
 # ── Colors ───────────────────────────────────────────────────────────────────
@@ -306,6 +311,103 @@ cleanup_vm() {
         fi
         wait "$VNG_PID" 2>/dev/null
     fi
+
+    # Remove session file after shutdown so the VM remains discoverable
+    # by 'join'/'list' if the kill above fails for any reason.
+    if [ -n "${SESSION_NAME:-}" ] && [ -n "${VNG_PID:-}" ]; then
+        remove_session "$SESSION_NAME" "$VNG_PID"
+    fi
+}
+
+# ── Session management ──────────────────────────────────────────────────────
+
+# Write a session file for a running VM so other processes can join it.
+# Session files live in $SESSION_DIR and are named <name>-<pid>.session.
+# No-op when SESSION_DIR is empty (XDG_RUNTIME_DIR unset).
+write_session() {
+    if [ -z "$SESSION_DIR" ]; then
+        warn "XDG_RUNTIME_DIR is not set; session tracking disabled ('join' will not work)"
+        return 0
+    fi
+
+    local name="$1"
+    local pid="$2"
+    local ssh_port="$3"
+    local workdir="$4"
+    local ssh_key="${5:-}"
+
+    mkdir -p -m 0700 "$SESSION_DIR"
+
+    cat > "$SESSION_DIR/${name}-${pid}.session" <<EOF
+name=$name
+pid=$pid
+ssh_port=$ssh_port
+workdir=$workdir
+ssh_key=$ssh_key
+started_at=$(date -Iseconds)
+EOF
+}
+
+# Remove the session file for a VM. No-op when SESSION_DIR is empty.
+remove_session() {
+    [ -n "$SESSION_DIR" ] || return 0
+    local name="$1"
+    local pid="$2"
+    rm -f "$SESSION_DIR/${name}-${pid}.session"
+}
+
+# Read a key from a session file. Returns empty string if missing.
+read_session() {
+    local session_file="$1"
+    local key="$2"
+
+    while IFS='=' read -r k v; do
+        if [ "$k" = "$key" ]; then
+            echo "$v"
+            return 0
+        fi
+    done < "$session_file"
+    return 0
+}
+
+# Remove session files whose PIDs are no longer running or whose pid
+# field is missing/invalid (treat as corrupt).
+cleanup_stale_sessions() {
+    [ -d "$SESSION_DIR" ] || return 0
+
+    for session_file in "$SESSION_DIR"/*.session; do
+        [ -f "$session_file" ] || continue
+        local pid
+        pid=$(read_session "$session_file" "pid")
+        if [ -z "$pid" ] || ! [[ "$pid" =~ ^[0-9]+$ ]]; then
+            # Missing or non-numeric pid — corrupt session file
+            rm -f "$session_file"
+        elif ! kill -0 "$pid" 2>/dev/null; then
+            rm -f "$session_file"
+        fi
+    done
+}
+
+# List active session files, optionally filtered by container name.
+# Prints one session file path per line.
+# Stale sessions are cleaned up first.
+list_active_sessions() {
+    local filter_name="${1:-}"
+
+    cleanup_stale_sessions
+    [ -d "$SESSION_DIR" ] || return 0
+
+    for session_file in "$SESSION_DIR"/*.session; do
+        [ -f "$session_file" ] || continue
+        if [ -n "$filter_name" ]; then
+            local name
+            name=$(read_session "$session_file" "name")
+            if [ "$name" != "$filter_name" ]; then
+                continue
+            fi
+        fi
+        echo "$session_file"
+    done
 }
 
 # ── Configuration file ───────────────────────────────────────────────────────
@@ -488,6 +590,7 @@ Run toolbox containers in VMs via virtme-ng.
 
 Commands:
   enter <name>    Export a toolbox container and enter it as a VM
+  join [<name>]   Open a new SSH session to a running VM
   list            Show cached rootfs entries and their freshness status
   clean [<name>]  Remove cached rootfs entries
 
@@ -547,6 +650,21 @@ Configuration file:
 EOF
 }
 
+usage_join() {
+    cat <<EOF
+Usage: $PROGNAME join [<name>] [options]
+
+Open a new SSH session to an already-running VM.
+
+If <name> is omitted and exactly one VM is running, that VM is joined
+automatically. If multiple VMs are running, an interactive menu is shown.
+
+Options:
+  --command <cmd>   Run <cmd> in the VM instead of an interactive shell
+  -h, --help        Show this help
+EOF
+}
+
 # ── Metadata / Cache ────────────────────────────────────────────────────────
 
 # Write metadata file after a successful export
@@ -571,16 +689,17 @@ read_meta() {
     local meta_path="$rootfs_dir/$META_FILE"
 
     if [ ! -f "$meta_path" ]; then
-        return
+        return 0
     fi
 
     # shellcheck disable=SC2034
     while IFS='=' read -r k v; do
         if [ "$k" = "$key" ]; then
             echo "$v"
-            return
+            return 0
         fi
     done < "$meta_path"
+    return 0
 }
 
 # Gather current container state and return as key=value lines.
@@ -1198,12 +1317,16 @@ cmd_enter() {
         "${vng_cmd[@]}" </dev/null &>/dev/null &
     fi
     VNG_PID=$!
+    SESSION_NAME="$name"
 
     # Ensure we clean up the VM on exit (Ctrl-C, errors, normal exit)
     trap cleanup_vm EXIT
 
     # Wait for SSH to become available
     wait_for_ssh "$ssh_port"
+
+    # Register this VM session so 'schupfn join' can find it
+    write_session "$name" "$VNG_PID" "$ssh_port" "$PWD" "$ssh_key"
 
     info "VM is up, connecting"
 
@@ -1268,6 +1391,133 @@ cmd_enter() {
     fi
 }
 
+# ── Subcommand: join ────────────────────────────────────────────────────────
+
+cmd_join() {
+    local name=""
+    local command=""
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help)
+                usage_join
+                exit 0
+                ;;
+            --command)
+                [ $# -ge 2 ] || die "--command requires an argument"
+                command="$2"
+                shift 2
+                ;;
+            -*)
+                die "unknown option: $1"
+                ;;
+            *)
+                if [ -z "$name" ]; then
+                    name="$1"
+                else
+                    die "unexpected argument: $1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    # Find matching sessions
+    local -a sessions=()
+    mapfile -t sessions < <(list_active_sessions "$name")
+    # mapfile with empty input may leave a single empty element; filter it.
+    if [ ${#sessions[@]} -eq 1 ] && [ -z "${sessions[0]}" ]; then
+        sessions=()
+    fi
+
+    if [ ${#sessions[@]} -eq 0 ]; then
+        if [ -n "$name" ]; then
+            die "no running VM found for '$name'"
+        else
+            die "no running VMs found"
+        fi
+        return 1
+    fi
+
+    local session_file
+    if [ ${#sessions[@]} -eq 1 ]; then
+        session_file="${sessions[0]}"
+    else
+        # Multiple sessions — show them and ask the user to pick one
+        echo "Multiple running VMs found:"
+        echo ""
+        local idx=1
+        for sf in "${sessions[@]}"; do
+            local sf_name sf_pid sf_port sf_workdir sf_started
+            sf_name=$(read_session "$sf" "name")
+            sf_pid=$(read_session "$sf" "pid")
+            sf_port=$(read_session "$sf" "ssh_port")
+            sf_workdir=$(read_session "$sf" "workdir")
+            sf_started=$(read_session "$sf" "started_at")
+            printf "  %d) %s (pid %s, port %s, dir %s, started %s)\n" \
+                "$idx" "$sf_name" "$sf_pid" "$sf_port" "$sf_workdir" "$sf_started"
+            idx=$((idx + 1))
+        done
+        echo ""
+        printf "Select VM [1-%d]: " "${#sessions[@]}"
+        local choice
+        read -r choice
+        if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "${#sessions[@]}" ]; then
+            die "invalid selection"
+            return 1
+        fi
+        session_file="${sessions[$((choice - 1))]}"
+    fi
+
+    # Read session details
+    local ssh_port workdir ssh_key
+    ssh_port=$(read_session "$session_file" "ssh_port")
+    workdir=$(read_session "$session_file" "workdir")
+    ssh_key=$(read_session "$session_file" "ssh_key")
+
+    if ! [[ "$ssh_port" =~ ^[0-9]+$ ]]; then
+        die "corrupted session file: invalid ssh_port '$ssh_port'"
+        return 1
+    fi
+
+    if [ -z "$name" ]; then
+        name=$(read_session "$session_file" "name")
+    fi
+
+    info "joining VM '$name' (ssh port $ssh_port)..."
+
+    # Build SSH options — same as cmd_enter
+    local -a ssh_opts=(
+        -o LogLevel=ERROR
+        -F "$HOME/.cache/virtme-ng/.ssh/virtme-ng-ssh.conf"
+    )
+    if [ -n "$ssh_key" ]; then
+        ssh_opts+=(-i "$ssh_key")
+    fi
+
+    local quoted_workdir
+    printf -v quoted_workdir '%q' "$workdir"
+    local remote_cmd
+    if [ -n "$command" ]; then
+        remote_cmd="cd $quoted_workdir && $command"
+    else
+        remote_cmd="cd $quoted_workdir && exec \$SHELL -l"
+    fi
+
+    ssh -t \
+        "${ssh_opts[@]}" \
+        -l "$(whoami)" \
+        "ssh://virtme-ng:$ssh_port" \
+        "$remote_cmd"
+    local rc=$?
+
+    if [ -n "$command" ]; then
+        exit "$rc"
+    elif [ $rc -ne 0 ]; then
+        warn "SSH session exited with status $rc"
+    fi
+}
+
 # ── Subcommand: list ────────────────────────────────────────────────────────
 
 cmd_list() {
@@ -1278,8 +1528,24 @@ cmd_list() {
 
     local found=0
 
-    printf "%-20s %-10s %-10s %s\n" "NAME" "STATUS" "SIZE" "EXPORTED"
-    printf "%-20s %-10s %-10s %s\n" "----" "------" "----" "--------"
+    # Clean up stale session files once, then build a per-name VM count
+    # in a single pass instead of calling list_active_sessions per rootfs.
+    cleanup_stale_sessions
+
+    declare -A _vm_counts=()
+    if [ -d "$SESSION_DIR" ]; then
+        for session_file in "$SESSION_DIR"/*.session; do
+            [ -f "$session_file" ] || continue
+            local sname
+            sname=$(read_session "$session_file" "name")
+            if [ -n "$sname" ]; then
+                _vm_counts["$sname"]=$(( ${_vm_counts["$sname"]:-0} + 1 ))
+            fi
+        done
+    fi
+
+    printf "%-20s %-10s %-10s %-10s %s\n" "NAME" "STATUS" "VMs" "SIZE" "EXPORTED"
+    printf "%-20s %-10s %-10s %-10s %s\n" "----" "------" "---" "----" "--------"
 
     for rootfs_dir in "$CACHE_DIR"/*/; do
         [ -d "$rootfs_dir" ] || continue
@@ -1311,7 +1577,16 @@ cmd_list() {
             status="orphaned"
         fi
 
-        printf "%-20s %-10s %-10s %s\n" "$name" "$status" "$size" "$exported_at"
+        # Look up running VM count from the pre-built map
+        local vm_count="${_vm_counts["$name"]:-0}"
+        local vm_display
+        if [ "$vm_count" -gt 0 ]; then
+            vm_display="$vm_count running"
+        else
+            vm_display="-"
+        fi
+
+        printf "%-20s %-10s %-10s %-10s %s\n" "$name" "$status" "$vm_display" "$size" "$exported_at"
     done
 
     if [ "$found" = "0" ]; then
@@ -1384,6 +1659,9 @@ main() {
     case "$command" in
         enter)
             cmd_enter "$@"
+            ;;
+        join)
+            cmd_join "$@"
             ;;
         list|ls)
             cmd_list "$@"
