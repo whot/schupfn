@@ -491,25 +491,35 @@ read_meta() {
     done < "$meta_path"
 }
 
-# Gather current container state and return as key=value lines
+# Gather current container state and return as key=value lines.
+# Merges two podman inspect --format calls into one (3 → 2 total).
 gather_container_state() {
     local name="$1"
 
-    local image_id
-    image_id=$(podman inspect --format '{{.Image}}' "$name" 2>/dev/null)
-    if [ $? -ne 0 ] || [ -z "$image_id" ]; then
+    # One podman inspect: --format gives us both IDs on separate lines.
+    local ids
+    ids=$(podman inspect --format '{{.Image}}{{"\n"}}{{.Id}}' "$name" 2>/dev/null) \
+        || die "failed to inspect container '$name'"
+
+    local image_id container_id
+    { read -r image_id; read -r container_id; } <<< "$ids"
+
+    if [ -z "$image_id" ]; then
         die "failed to get image ID for container '$name'"
     fi
-
-    local container_id
-    container_id=$(podman inspect --format '{{.Id}}' "$name" 2>/dev/null)
-    if [ $? -ne 0 ] || [ -z "$container_id" ]; then
+    if [ -z "$container_id" ]; then
         die "failed to get container ID for '$name'"
     fi
 
-    local inspect_hash
-    inspect_hash=$(podman inspect "$name" 2>/dev/null | sha256sum | cut -d' ' -f1)
-    if [ $? -ne 0 ] || [ -z "$inspect_hash" ]; then
+    # Hash the full JSON for change detection.  This is a second
+    # podman inspect, but the alternative (parsing JSON in bash) is
+    # worse.  The original code used three separate calls and checked
+    # $? of cut (always 0) instead of podman inspect.
+    local inspect_hash_raw
+    inspect_hash_raw=$(podman inspect "$name" 2>/dev/null | sha256sum)
+    local inspect_hash="${inspect_hash_raw%%[[:space:]]*}"
+
+    if [ -z "$inspect_hash" ]; then
         die "failed to compute inspect hash for '$name'"
     fi
 
