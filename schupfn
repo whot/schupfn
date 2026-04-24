@@ -56,6 +56,20 @@ check_prerequisites() {
     check_command ssh
 }
 
+# Validate that a container name is safe for use in path construction.
+# Rejects names containing path separators or traversal sequences.
+validate_container_name() {
+    local name="$1"
+    case "$name" in
+        */*|*..*)
+            die "invalid container name '$name': must not contain '/' or '..'"
+            ;;
+        .*)
+            die "invalid container name '$name': must not start with '.'"
+            ;;
+    esac
+}
+
 # Classify a single export path as a directory or file.
 # Directories are appended to rw_mount_dirs or ro_mount_dirs (depending
 # on mode). Files are appended to dotfiles. Symlinks that point to a
@@ -926,6 +940,8 @@ cmd_enter() {
         die "container name required. See '$PROGNAME enter --help'."
     fi
 
+    validate_container_name "$name"
+
     # Merge: config exports come first, CLI exports are appended
     exports=("${_cfg_exports[@]}" "${exports[@]}")
     exports_rw=("${_cfg_exports_rw[@]}" "${exports_rw[@]}")
@@ -1226,6 +1242,7 @@ cmd_clean() {
     local name="${1:-}"
 
     if [ -n "$name" ]; then
+        validate_container_name "$name"
         local rootfs_dir="$CACHE_DIR/$name"
         if [ ! -d "$rootfs_dir" ]; then
             die "no cached rootfs for '$name'"
