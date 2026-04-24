@@ -778,7 +778,9 @@ export_rootfs() {
         fi
     fi
 
-    mkdir -p "$rootfs_dir"
+    # Use restrictive permissions so other users cannot read the rootfs
+    # contents (container filesystem, passwd/group entries, config, etc.)
+    mkdir -p -m 0700 "$rootfs_dir"
     if [ $? -ne 0 ]; then
         die "failed to create directory '$rootfs_dir'"
     fi
