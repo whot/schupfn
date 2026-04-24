@@ -1164,11 +1164,13 @@ cmd_enter() {
     # prompt. Use the vng SSH config for host key and identity settings,
     # and the "ssh://virtme-ng:<port>" destination so the Host wildcard
     # matches.
+    local quoted_pwd
+    printf -v quoted_pwd '%q' "$PWD"
     local remote_cmd
     if [ -n "$command" ]; then
-        remote_cmd="cd $PWD && $command"
+        remote_cmd="cd $quoted_pwd && $command"
     else
-        remote_cmd="cd $PWD && exec \$SHELL -l"
+        remote_cmd="cd $quoted_pwd && exec \$SHELL -l"
     fi
 
     ssh -t \
