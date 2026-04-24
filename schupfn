@@ -749,7 +749,7 @@ fix_sshd_privsep() {
     # Rename the real sshd and install a wrapper.
     # Need podman unshare because /usr/sbin is dr-xr-xr-x.
     podman unshare mv "$sshd_path" "$sshd_real"
-    podman unshare bash -c "cat > '$sshd_path'" <<'WRAPPER'
+    podman unshare bash -c 'cat > "$1"' _ "$sshd_path" <<'WRAPPER'
 #!/bin/bash
 # schupfn: sshd wrapper to fix privsep directory ownership on 9p rootfs
 privsep_dir=/usr/share/empty.sshd
