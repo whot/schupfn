@@ -14,7 +14,8 @@ to sandbox AI coding agents that might try to escape a container.
 underneath.
 
 ["Schupfn"](https://en.wiktionary.org/wiki/Schupfn) is Austrian slang for a
-shed. That's where you keep your toolboxes.
+shed. That's where you keep your toolboxes. The `u` is pronounced like the `u`
+in "unsuccessful".
 
 ## Requirements
 
