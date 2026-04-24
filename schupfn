@@ -696,7 +696,7 @@ prepare_rootfs_user() {
     local uid gid homedir shell
     uid=$(id -u)
     gid=$(id -g)
-    homedir=$(eval echo "~$username")
+    homedir="$HOME"
     shell=$(getent passwd "$username" | cut -d: -f7)
     shell="${shell:-/bin/bash}"
 
