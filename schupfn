@@ -177,7 +177,7 @@ find_free_port() {
             return 0
         fi
     done
-    die "could not find a free port for SSH"
+    die "failed to find a free port for SSH"
 }
 
 # Wait until SSH inside the VM is reachable, then return.
