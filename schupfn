@@ -539,10 +539,14 @@ check_freshness() {
     local current_state
     current_state=$(gather_container_state "$name")
 
-    local current_image_id current_container_id current_inspect_hash
-    current_image_id=$(echo "$current_state" | grep '^image_id=' | cut -d= -f2-)
-    current_container_id=$(echo "$current_state" | grep '^container_id=' | cut -d= -f2-)
-    current_inspect_hash=$(echo "$current_state" | grep '^inspect_hash=' | cut -d= -f2-)
+    local current_image_id="" current_container_id="" current_inspect_hash=""
+    while IFS='=' read -r k v; do
+        case "$k" in
+            image_id)       current_image_id="$v" ;;
+            container_id)   current_container_id="$v" ;;
+            inspect_hash)   current_inspect_hash="$v" ;;
+        esac
+    done <<< "$current_state"
 
     if [ "$stored_image_id" != "$current_image_id" ]; then
         info "image ID changed for '$name'"
@@ -755,10 +759,14 @@ export_rootfs() {
     local state
     state=$(gather_container_state "$name")
 
-    local image_id container_id inspect_hash
-    image_id=$(echo "$state" | grep '^image_id=' | cut -d= -f2-)
-    container_id=$(echo "$state" | grep '^container_id=' | cut -d= -f2-)
-    inspect_hash=$(echo "$state" | grep '^inspect_hash=' | cut -d= -f2-)
+    local image_id="" container_id="" inspect_hash=""
+    while IFS='=' read -r k v; do
+        case "$k" in
+            image_id)       image_id="$v" ;;
+            container_id)   container_id="$v" ;;
+            inspect_hash)   inspect_hash="$v" ;;
+        esac
+    done <<< "$state"
 
     write_meta "$rootfs_dir" "$image_id" "$container_id" "$inspect_hash"
 
