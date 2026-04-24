@@ -77,14 +77,14 @@ teardown() {
     [[ "${rootfs_symlinks[0]}" == *":$(realpath "$TMPDIR/realdir")" ]]
 }
 
-@test "classify_export: symlink to file goes to dotfiles with resolved path" {
+@test "classify_export: symlink to file goes to dotfiles with link path" {
     touch "$TMPDIR/realfile"
     ln -s "$TMPDIR/realfile" "$TMPDIR/linkfile"
 
     classify_export "$TMPDIR/linkfile" "ro"
     assert_die_not_called
     [ "${#dotfiles[@]}" -eq 1 ]
-    [ "${dotfiles[0]}" = "$(realpath "$TMPDIR/realfile")" ]
+    [ "${dotfiles[0]}" = "$TMPDIR/linkfile" ]
 }
 
 # ── Error cases ──────────────────────────────────────────────────────────
