@@ -332,6 +332,28 @@ Use a config file so you only need to type:
 schupfn enter
 .EE
 .in
+.SH CAVEATS
+.TP
+.B Running from $HOME
+.B schupfn
+refuses to start when the current working directory is
+.BR $HOME .
+The VM mounts
+.B $PWD
+via 9p (plan\~9 filesystem protocol), which does not support POSIX
+file locking or
+.BR mmap .
+Mounting
+.B $HOME
+via 9p would shadow the tmpfs\-backed overlay on
+.BR /home ,
+causing applications that depend on these features (e.g.\& SQLite
+WAL mode) to fail.
+Run
+.B schupfn
+from a subdirectory of
+.B $HOME
+instead.
 .SH SEE ALSO
 .BR toolbox (1),
 .BR podman (1),

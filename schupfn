@@ -966,6 +966,16 @@ cmd_enter() {
         export_rootfs "$name" "$rootfs_dir"
     fi
 
+    # Refuse to run from $HOME: mounting it via --rwdir (9p) would shadow
+    # the --overlay-rwdir on /home, causing everything under $HOME to sit
+    # on 9p. Applications that need POSIX file locking or mmap (e.g.
+    # SQLite WAL mode) will break.
+    if [ "$PWD" = "$HOME" ]; then
+        die "refusing to start from \$HOME — the 9p mount would shadow" \
+            "the overlay on /home and break applications that need" \
+            "POSIX file locking. Please cd to a subdirectory first."
+    fi
+
     # Classify each --export-ro / --export-rw path as a directory or file.
     # See classify_export() for details.
     local -a rw_mount_dirs=("$PWD")   # $PWD is always read-write
