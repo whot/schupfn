@@ -277,17 +277,32 @@ cleanup_vm() {
 find_config_file() {
     local dir="$1"
     local container="${2:-}"
-    while true; do
-        local candidate="$dir/.schupfn/config.yml"
-        if [ -f "$candidate" ]; then
-            echo "$candidate"
-            return 0
-        fi
-        if [ "$dir" = "/" ]; then
-            break
-        fi
-        dir="${dir%/*}"
-        [ -z "$dir" ] && dir="/"
+    local physical_dir
+    physical_dir="$(realpath "$dir" 2>/dev/null)" || physical_dir="$dir"
+
+    # Walk upward from the logical path first, then (if it differs)
+    # from the physical path, so configs next to the real directory
+    # are found even when $PWD is a symlink.
+    local -a roots=("$dir")
+    if [ "$physical_dir" != "$dir" ]; then
+        roots+=("$physical_dir")
+    fi
+
+    local root
+    for root in "${roots[@]}"; do
+        local d="$root"
+        while true; do
+            local candidate="$d/.schupfn/config.yml"
+            if [ -f "$candidate" ]; then
+                realpath "$candidate"
+                return 0
+            fi
+            if [ "$d" = "/" ]; then
+                break
+            fi
+            d="${d%/*}"
+            [ -z "$d" ] && d="/"
+        done
     done
 
     # Fall back to user-level config under XDG_CONFIG_HOME
@@ -984,11 +999,24 @@ cmd_enter() {
         export_rootfs "$name" "$rootfs_dir"
     fi
 
+    # Resolve $PWD to its physical path so the 9p mount uses a real
+    # directory, not a symlink.  Keep the logical path for virtme_chdir
+    # so the user lands in the expected directory.
+    local physical_pwd
+    if ! physical_pwd="$(realpath "$PWD" 2>/dev/null)" || [ -z "$physical_pwd" ]; then
+        die "cannot resolve current directory '$PWD' —" \
+            "it may have been deleted or permissions are insufficient."
+    fi
+
     # Refuse to run from $HOME: mounting it via --rwdir (9p) would shadow
     # the --overlay-rwdir on /home, causing everything under $HOME to sit
     # on 9p. Applications that need POSIX file locking or mmap (e.g.
     # SQLite WAL mode) will break.
-    if [ "$PWD" = "$HOME" ]; then
+    # Resolve $HOME to its physical path so the check still works when
+    # $HOME itself is a symlink (e.g. /home/user -> /data/users/user).
+    local physical_home
+    physical_home="$(realpath "$HOME" 2>/dev/null)" || physical_home="$HOME"
+    if [ "$physical_pwd" = "$physical_home" ] || [ "$PWD" = "$HOME" ]; then
         die "refusing to start from \$HOME — the 9p mount would shadow" \
             "the overlay on /home and break applications that need" \
             "POSIX file locking. Please cd to a subdirectory first."
@@ -996,10 +1024,16 @@ cmd_enter() {
 
     # Classify each --export-ro / --export-rw path as a directory or file.
     # See classify_export() for details.
-    local -a rw_mount_dirs=("$PWD")   # $PWD is always read-write
+    local -a rw_mount_dirs=("$physical_pwd")   # $PWD is always read-write
     local -a ro_mount_dirs=()
     local -a rootfs_symlinks=()
     local -a dotfiles=()
+
+    # If $PWD is (or passes through) a symlink, recreate it in the rootfs
+    # so that virtme_chdir and the SSH "cd" both land in the right place.
+    if [ "$PWD" != "$physical_pwd" ]; then
+        rootfs_symlinks+=("$PWD:$physical_pwd")
+    fi
 
     for path in "${exports[@]}"; do
         classify_export "$path" "ro"

@@ -5,6 +5,9 @@ load test_helper
 setup() {
     reset_die
     TMPDIR="$(make_tmpdir)"
+    # Resolve symlinks (e.g. /tmp -> /private/tmp on macOS) so expected
+    # paths match the realpath output from find_config_file().
+    TMPDIR="$(realpath "$TMPDIR")"
     # Prevent the XDG fallback from finding a real config on the host.
     # Tests that exercise the XDG path set this to their own value.
     export XDG_CONFIG_HOME="$TMPDIR/xdg-config-none"
@@ -193,4 +196,35 @@ teardown() {
     XDG_CONFIG_HOME="$TMPDIR/nonexistent" run find_config_file "$TMPDIR/project" "mybox"
     [ "$status" -eq 1 ]
     [ -z "$output" ]
+}
+
+# ── Symlink handling tests ──────────────────────────────────────────────────
+
+@test "find_config_file: finds config via symlink when PWD is a symlink to project" {
+    # Real project with a config
+    mkdir -p "$TMPDIR/real-project/.schupfn"
+    echo "container: real" > "$TMPDIR/real-project/.schupfn/config.yml"
+
+    # Symlink pointing to the project — the logical walk finds the config
+    # through the symlink, but the returned path is resolved to the
+    # canonical physical path so callers always get a consistent result.
+    ln -s "$TMPDIR/real-project" "$TMPDIR/link-to-project"
+
+    run find_config_file "$TMPDIR/link-to-project"
+    [ "$status" -eq 0 ]
+    [ "$output" = "$TMPDIR/real-project/.schupfn/config.yml" ]
+}
+
+@test "find_config_file: finds config in physical parent when symlink is to subdirectory" {
+    # Real project with a config
+    mkdir -p "$TMPDIR/real-project/.schupfn"
+    echo "container: real" > "$TMPDIR/real-project/.schupfn/config.yml"
+    mkdir -p "$TMPDIR/real-project/subdir"
+
+    # Symlink pointing to a subdirectory
+    ln -s "$TMPDIR/real-project/subdir" "$TMPDIR/link-to-subdir"
+
+    run find_config_file "$TMPDIR/link-to-subdir"
+    [ "$status" -eq 0 ]
+    [ "$output" = "$TMPDIR/real-project/.schupfn/config.yml" ]
 }
