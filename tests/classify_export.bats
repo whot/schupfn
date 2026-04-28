@@ -151,3 +151,85 @@ teardown() {
     add_overlay "/opt/tool"
     [ "${#overlay_dirs[@]}" -eq 3 ]
 }
+
+# ── check_nested_export_conflicts ────────────────────────────────────────
+
+@test "check_nested_export_conflicts: rw child inside ro parent errors" {
+    mkdir -p "$TMPDIR/foo/bar"
+
+    classify_export "$TMPDIR/foo" "ro"
+    classify_export "$TMPDIR/foo/bar" "rw"
+    assert_die_not_called
+
+    check_nested_export_conflicts || true
+    assert_die_called "conflicting exports"
+    assert_die_called "nested inside"
+}
+
+@test "check_nested_export_conflicts: ro child inside rw parent errors" {
+    mkdir -p "$TMPDIR/foo/bar"
+
+    classify_export "$TMPDIR/foo" "rw"
+    classify_export "$TMPDIR/foo/bar" "ro"
+    assert_die_not_called
+
+    check_nested_export_conflicts || true
+    assert_die_called "conflicting exports"
+    assert_die_called "nested inside"
+}
+
+@test "check_nested_export_conflicts: non-overlapping dirs are fine" {
+    mkdir -p "$TMPDIR/aaa" "$TMPDIR/bbb"
+
+    classify_export "$TMPDIR/aaa" "ro"
+    classify_export "$TMPDIR/bbb" "rw"
+    assert_die_not_called
+
+    check_nested_export_conflicts || true
+    assert_die_not_called
+}
+
+@test "check_nested_export_conflicts: same mode nesting is fine" {
+    mkdir -p "$TMPDIR/foo/bar"
+
+    classify_export "$TMPDIR/foo" "ro"
+    classify_export "$TMPDIR/foo/bar" "ro"
+    assert_die_not_called
+
+    check_nested_export_conflicts || true
+    assert_die_not_called
+}
+
+@test "check_nested_export_conflicts: similarly named dirs are not nested" {
+    mkdir -p "$TMPDIR/foobar" "$TMPDIR/foo"
+
+    classify_export "$TMPDIR/foo" "ro"
+    classify_export "$TMPDIR/foobar" "rw"
+    assert_die_not_called
+
+    check_nested_export_conflicts || true
+    assert_die_not_called
+}
+
+@test "check_nested_export_conflicts: same path as ro and rw errors" {
+    mkdir -p "$TMPDIR/foo"
+
+    classify_export "$TMPDIR/foo" "ro"
+    classify_export "$TMPDIR/foo" "rw"
+    assert_die_not_called
+
+    check_nested_export_conflicts || true
+    assert_die_called "conflicting exports"
+}
+
+@test "check_nested_export_conflicts: root ro parent catches rw child" {
+    # Bypass classify_export to avoid realpath on dirs we may not own;
+    # inject "/" and a child path directly into the arrays.
+    ro_mount_dirs=("/")
+    rw_mount_dirs=("/child")
+    assert_die_not_called
+
+    check_nested_export_conflicts || true
+    assert_die_called "conflicting exports"
+    assert_die_called "nested inside"
+}
