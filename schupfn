@@ -132,6 +132,49 @@ add_overlay() {
     fi
 }
 
+# Check for nested export conflicts between rw_mount_dirs and
+# ro_mount_dirs. A 9p mount on a parent directory shadows any child
+# mount, so --export-ro /foo --export-rw /foo/bar cannot work: the ro
+# mount on /foo makes everything beneath it read-only regardless of the
+# child --rwdir.
+#
+# These arrays must exist in the caller's scope:
+#   rw_mount_dirs, ro_mount_dirs
+check_nested_export_conflicts() {
+    local rw ro
+    for rw in "${rw_mount_dirs[@]}"; do
+        for ro in "${ro_mount_dirs[@]}"; do
+            # Exact same path exported as both ro and rw
+            if [[ "$rw" = "$ro" ]]; then
+                die "conflicting exports: '$rw' is exported as both" \
+                    "ro and rw. Remove one of the duplicate exports."
+            fi
+
+            # Build a prefix that works for root "/" without producing
+            # a double-slash ("//child" would never match "/child").
+            local ro_prefix="$ro"
+            [[ "$ro_prefix" != "/" ]] && ro_prefix+="/"
+            local rw_prefix="$rw"
+            [[ "$rw_prefix" != "/" ]] && rw_prefix+="/"
+
+            # rw dir is a child of an ro dir
+            if [[ "$rw" = "$ro_prefix"* ]]; then
+                die "conflicting exports: '$rw' (rw) is nested inside" \
+                    "'$ro' (ro). The read-only mount on the parent" \
+                    "shadows the child. Remove one or export the parent" \
+                    "as rw."
+            fi
+            # ro dir is a child of an rw dir
+            if [[ "$ro" = "$rw_prefix"* ]]; then
+                die "conflicting exports: '$ro' (ro) is nested inside" \
+                    "'$rw' (rw). The read-write mount on the parent" \
+                    "shadows the child. Remove one or export the parent" \
+                    "as ro."
+            fi
+        done
+    done
+}
+
 # Verify the container has the packages schupfn needs and offer to
 # install any that are missing.
 check_container_prerequisites() {
@@ -1041,6 +1084,8 @@ cmd_enter() {
     for path in "${exports_rw[@]}"; do
         classify_export "$path" "rw"
     done
+
+    check_nested_export_conflicts
 
     # Ensure mount points exist inside the rootfs so virtme-ng can
     # set them up. The rootfs is used with --rw so this is persistent
