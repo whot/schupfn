@@ -838,7 +838,7 @@ install_vm_modules() {
     local -a mod_pairs=()
     while IFS= read -r line; do
         local mod_path="${line#insmod }"
-        mod_path="${mod_path%%[[:space:]]}"
+        mod_path="${mod_path%%[[:space:]]*}"
         if [ -f "$mod_path" ]; then
             local rel_path="${mod_path#/lib/modules/$kver/}"
             mod_pairs+=("$mod_path" "$rootfs_moddir/$rel_path")
