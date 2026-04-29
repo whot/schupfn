@@ -1271,6 +1271,17 @@ cmd_enter() {
         add_overlay "$dir"
     done
 
+    # Overlay key system directories so the VM sees correct file ownership.
+    # The rootfs is served via 9p with security_model=none, meaning all
+    # files appear owned by the host user's UID. This breaks programs
+    # that require root ownership (sudo needs setuid-root, rpm/dnf need
+    # root-owned database files, PAM checks /etc/sudoers ownership, etc.).
+    # An overlayfs on top of 9p restores the original ownership from the
+    # container image for everything that is not written to at runtime.
+    for sysdir in /usr /var /etc; do
+        add_overlay "$sysdir"
+    done
+
     for dir in "${overlay_dirs[@]}"; do
         vng_cmd+=(--overlay-rwdir "$dir")
     done
