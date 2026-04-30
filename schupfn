@@ -1022,6 +1022,38 @@ WRAPPER
     podman unshare chmod +x "$sshd_path"
 }
 
+# Fix permissions on files that need special modes to function correctly
+# inside the VM.  The exported rootfs is extracted by an unprivileged user,
+# so setuid bits are lost and some binaries have restrictive modes that
+# prevent overlayfs copy-up (which needs to read the file content).
+#
+# Uses podman unshare to operate in a user namespace where we are root,
+# allowing us to chmod files in directories that are dr-xr-xr-x.
+fix_rootfs_permissions() {
+    local rootfs_dir="$1"
+
+    # sudo: needs to be readable (for overlayfs copy-up) and its
+    # directories need write permission (for RPM to install into them).
+    # The setuid bit cannot be preserved on 9p with security_model=none,
+    # but making the binary readable allows the in-VM copy-up fixup to
+    # work.
+    podman unshare bash -c '
+        rootfs="$1"
+        # Make key system directories writable so overlayfs copy-up
+        # produces directories that root can write to inside the VM.
+        for d in usr/bin usr/sbin usr/lib usr/lib64 usr/libexec usr/include; do
+            [ -d "$rootfs/$d" ] && chmod 0755 "$rootfs/$d"
+        done
+        # Make setuid/setgid binaries readable so overlayfs can copy
+        # them up.  The setuid bit itself is lost on 9p, but readability
+        # allows the in-VM fixup to restore it.
+        find "$rootfs/usr" -type f \( -perm /4000 -o -perm /2000 \) -exec chmod a+r {} +
+        # Also fix any execute-only binaries (e.g. sudo is ---x--x--x
+        # on some distros) that would block overlayfs copy-up.
+        find "$rootfs/usr" -type f -perm /0111 ! -perm /0444 -exec chmod a+r {} +
+    ' _ "$rootfs_dir"
+}
+
 export_rootfs() {
     local name="$1"
     local rootfs_dir="$2"
@@ -1069,6 +1101,15 @@ export_rootfs() {
     # by root. We wrap sshd with a script that bind-mounts a tmpfs (which
     # IS owned by root) over the privsep directory before starting sshd.
     fix_sshd_privsep "$rootfs_dir"
+
+    # Fix file permissions in the exported rootfs.  The 9p filesystem
+    # with security_model=none presents files with the host user's UID
+    # and the original mode bits from the tar extraction.  Setuid binaries
+    # like sudo lose their setuid bit, and files with restrictive modes
+    # (e.g. ---x--x--x for sudo) cannot be copied up by overlayfs because
+    # the kernel cannot read the file content.  Fix the permissions in the
+    # rootfs before booting so that overlayfs copy-up works correctly.
+    fix_rootfs_permissions "$rootfs_dir"
 
     # Gather state and write metadata
     local state
@@ -1457,6 +1498,22 @@ cmd_enter() {
                 "tar -xf - -C /" 2>/dev/null \
         || warn "failed to copy exported files"
     fi
+
+    # Fix sudo inside the VM.  The rootfs is served via 9p with
+    # security_model=none, which strips the setuid bit from binaries.
+    # fix_rootfs_permissions() already made the binary readable in the
+    # exported rootfs so overlayfs can copy it up.  Here we copy it to
+    # the overlay upper layer and restore ownership + setuid.
+    # We SSH as root because sudo itself is not yet functional.
+    local copyup_output
+    copyup_output=$(ssh "${ssh_opts[@]}" -l root "ssh://virtme-ng:$ssh_port" \
+        'if [ -f /usr/bin/sudo ]; then
+            cp -a /usr/bin/sudo /usr/bin/sudo.tmp &&
+            mv /usr/bin/sudo.tmp /usr/bin/sudo &&
+            chown root:root /usr/bin/sudo &&
+            chmod 4755 /usr/bin/sudo
+        fi' 2>&1) \
+    || warn "failed to fix sudo: $copyup_output"
 
     # SSH into the VM. We call ssh directly (rather than vng --ssh-client)
     # because --remote-cmd doesn't allocate a PTY, resulting in no visible
