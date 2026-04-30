@@ -1,12 +1,12 @@
 #!/bin/bash
 #
-# schupfn - run toolbox containers in VMs via virtme-ng
+# schupfn - run toolbox containers in VMs via qemu
 #
 # SPDX-License-Identifier: Apache-2.0
 
 PROGNAME="schupfn"
-VERSION="0.1.0"
-CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/schupfn/roots"
+VERSION="0.2.0"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/schupfn/images"
 if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
     SESSION_DIR="$XDG_RUNTIME_DIR/schupfn/sessions"
 else
@@ -57,7 +57,11 @@ check_command() {
 
 check_prerequisites() {
     check_command podman
-    check_command vng
+    check_command buildah
+    check_command qemu-system-x86_64
+    check_command qemu-img
+    check_command virt-make-fs
+    check_command virt-customize
     check_command ssh
 }
 
@@ -93,6 +97,15 @@ classify_export() {
         die "export path does not exist: $path"
     fi
 
+    # Paths with spaces or colons cannot be passed via the kernel command
+    # line (parsed by word-splitting in the guest mount script).
+    if [[ "$path" == *" "* || "$path" == *$'\t'* ]]; then
+        die "export path contains whitespace, which is not supported: $path"
+    fi
+    if [[ "$path" == *":"* ]]; then
+        die "export path contains a colon, which is not supported: $path"
+    fi
+
     if [ -d "$path" ]; then
         local resolved
         resolved="$(realpath "$path")"
@@ -119,29 +132,11 @@ classify_export() {
     fi
 }
 
-# Add a directory's top-level component to the overlay list if not
-# already present. The overlay_dirs array must exist in the caller's scope.
-add_overlay() {
-    local top_dir
-    top_dir=$(echo "$1" | cut -d/ -f2)
-    top_dir="/$top_dir"
-    local found=0
-    for d in "${overlay_dirs[@]}"; do
-        if [ "$d" = "$top_dir" ]; then
-            found=1
-            break
-        fi
-    done
-    if [ "$found" = "0" ]; then
-        overlay_dirs+=("$top_dir")
-    fi
-}
-
 # Check for nested export conflicts between rw_mount_dirs and
 # ro_mount_dirs. A 9p mount on a parent directory shadows any child
 # mount, so --export-ro /foo --export-rw /foo/bar cannot work: the ro
 # mount on /foo makes everything beneath it read-only regardless of the
-# child --rwdir.
+# child mount.
 #
 # These arrays must exist in the caller's scope:
 #   rw_mount_dirs, ro_mount_dirs
@@ -188,15 +183,15 @@ check_container_prerequisites() {
 
     # Mount the container, check all binaries, unmount — in a single
     # podman unshare call.  Each podman unshare creates a user namespace
-    # so batching saves significant overhead (5 calls → 1).
+    # so batching saves significant overhead.
     local check_result
     check_result=$(podman unshare bash -c '
         mnt=$(podman mount "$1" 2>/dev/null) || exit 1
         test -x "$mnt/usr/sbin/sshd" || echo openssh-server
         test -x "$mnt/usr/lib/systemd/systemd-udevd" || \
             test -x "$mnt/lib/systemd/systemd-udevd" || echo systemd-udev
-        test -x "$mnt/usr/bin/busybox" || \
-            test -x "$mnt/bin/busybox" || echo busybox
+        test -x "$mnt/usr/bin/dbus-broker" || \
+            test -x "$mnt/usr/bin/dbus-daemon" || echo dbus-broker
         podman unmount "$1" >/dev/null 2>&1
     ' _ "$name" 2>/dev/null) || die "failed to mount container '$name' for prerequisite check"
 
@@ -227,7 +222,7 @@ check_container_prerequisites() {
 
 # ── SSH / VM lifecycle ──────────────────────────────────────────────────────
 
-# Find a free port for SSH (VSOCK CID or TCP port, depending on vng's choice).
+# Find a free port for SSH.
 # We pick a random port in the ephemeral range and verify it's not in use.
 find_free_port() {
     local port
@@ -243,21 +238,65 @@ find_free_port() {
 }
 
 # Wait until SSH inside the VM is reachable, then return.
-# Uses vng --ssh-client with a short-lived test command.
+# $1 = port, remaining args = SSH key files to try
 wait_for_ssh() {
     local port="$1"
-    local timeout="${2:-60}"
+    shift
+    local -a keys=("$@")
+    local timeout=30
     local elapsed=0
+
+    # Build -i flags for all provided keys
+    local -a key_flags=()
+    for k in "${keys[@]}"; do
+        key_flags+=(-i "$k")
+    done
 
     info "waiting for VM to boot..."
 
+    local port_reached=0
+
+    # Initial delay: qemu's SLIRP stack accepts TCP connections on the
+    # hostfwd port immediately (before the guest has networking), but
+    # can't forward data until the guest's virtio-net is up.  Early
+    # connections get stuck in SLIRP's backlog and never complete the
+    # SSH handshake.  Wait a few seconds for the guest to boot first.
+    sleep 3
+    elapsed=3
+
     while [ "$elapsed" -lt "$timeout" ]; do
         # Check that the background VM process is still alive
-        if [ -n "${VNG_PID:-}" ] && ! kill -0 "$VNG_PID" 2>/dev/null; then
+        if [ -n "${QEMU_PID:-}" ] && ! kill -0 "$QEMU_PID" 2>/dev/null; then
+            # Show qemu log if available to help diagnose the failure
+            if [ -n "${QEMU_LOG:-}" ] && [ -f "$QEMU_LOG" ] && [ -s "$QEMU_LOG" ]; then
+                warn "qemu output:"
+                sed 's/^/  /' "$QEMU_LOG" >&2
+            fi
             die "VM process exited before SSH became available"
         fi
 
-        if vng --ssh-client "$port" --ssh-tcp --remote-cmd "true" >/dev/null 2>&1; then
+        # First check: is the port even reachable? (TCP connect)
+        if [ "$port_reached" = "0" ]; then
+            if bash -c "echo >/dev/tcp/127.0.0.1/$port" 2>/dev/null; then
+                port_reached=1
+                info "SSH port is open, authenticating..."
+            fi
+        fi
+
+        if ssh -4 -F /dev/null \
+               -o BatchMode=yes \
+               -o ConnectTimeout=3 \
+               -o ServerAliveInterval=2 \
+               -o ServerAliveCountMax=1 \
+               -o StrictHostKeyChecking=no \
+               -o UserKnownHostsFile=/dev/null \
+               -o IdentitiesOnly=yes \
+               -o ControlPath=none \
+               -o PubkeyAcceptedAlgorithms=+ssh-rsa \
+               -o LogLevel=ERROR \
+               "${key_flags[@]}" \
+               -p "$port" \
+               127.0.0.1 true >/dev/null 2>&1; then
             return 0
         fi
 
@@ -265,7 +304,24 @@ wait_for_ssh() {
         elapsed=$((elapsed + 1))
     done
 
-    die "timed out waiting for SSH (${timeout}s). VM may have failed to boot."
+    # Provide a more specific error message
+    if [ "$port_reached" = "0" ]; then
+        die "timed out waiting for SSH (${timeout}s). Port $port never became reachable — sshd may not have started in the VM."
+    else
+        # Port was open but authentication failed — show SSH debug output
+        warn "SSH port is reachable but authentication failed. Debug output:"
+        ssh -4 -F /dev/null -v -o BatchMode=yes \
+            -o ConnectTimeout=5 \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            -o IdentitiesOnly=yes \
+            -o ControlPath=none \
+            -o PubkeyAcceptedAlgorithms=+ssh-rsa \
+            "${key_flags[@]}" \
+            -p "$port" \
+            127.0.0.1 true 2>&1 | sed 's/^/  /' >&2
+        die "timed out waiting for SSH (${timeout}s). Port is open but sshd not responding (banner exchange timeout). Keys: ${keys[*]}"
+    fi
 }
 
 # Collect all PIDs in the process tree rooted at $1 (depth-first).
@@ -280,35 +336,38 @@ _pstree_pids() {
 }
 
 # Clean up the background VM process. Called via trap on EXIT.
-# vng spawns a shell which spawns qemu, so we must kill the entire
-# process tree — not just the top-level PID — to avoid orphaned
-# qemu instances.
 #
 # If any 'join' sessions are still connected, the function waits for
 # them to disconnect before shutting down.
 cleanup_vm() {
-    if [ -n "${VNG_PID:-}" ] && kill -0 "$VNG_PID" 2>/dev/null; then
+    if [ -n "${QEMU_PID:-}" ] && kill -0 "$QEMU_PID" 2>/dev/null; then
 
         # Wait for active join sessions to finish
         if [ -n "${SESSION_NAME:-}" ]; then
             local joins
-            joins=$(count_active_joins "$SESSION_NAME" "$VNG_PID")
+            joins=$(count_active_joins "$SESSION_NAME" "$QEMU_PID")
             if [ "$joins" -gt 0 ]; then
                 warn "VM kept alive — $joins active join session(s) still connected"
                 info "waiting for join session(s) to disconnect before shutting down..."
+                local wait_count=0
                 while true; do
-                    joins=$(count_active_joins "$SESSION_NAME" "$VNG_PID")
+                    joins=$(count_active_joins "$SESSION_NAME" "$QEMU_PID")
                     [ "$joins" -gt 0 ] || break
+                    wait_count=$((wait_count + 1))
+                    if [ "$wait_count" -ge 300 ]; then
+                        warn "timed out waiting for join sessions after 300s, shutting down anyway"
+                        break
+                    fi
                     sleep 1
                 done
-                info "all join sessions disconnected"
+                [ "$joins" -eq 0 ] && info "all join sessions disconnected"
             fi
         fi
 
-        info "shutting down VM (pid $VNG_PID)..."
+        info "shutting down VM (pid $QEMU_PID)..."
         # Collect the full process tree (children before parents)
         local -a pids
-        mapfile -t pids < <(_pstree_pids "$VNG_PID")
+        mapfile -t pids < <(_pstree_pids "$QEMU_PID")
 
         # Graceful SIGTERM to the whole tree
         for pid in "${pids[@]}"; do
@@ -317,25 +376,25 @@ cleanup_vm() {
 
         # Give them a moment to shut down
         local i=0
-        while kill -0 "$VNG_PID" 2>/dev/null && [ "$i" -lt 5 ]; do
+        while kill -0 "$QEMU_PID" 2>/dev/null && [ "$i" -lt 5 ]; do
             sleep 1
             i=$((i + 1))
         done
 
         # Force kill any survivors
-        if kill -0 "$VNG_PID" 2>/dev/null; then
-            mapfile -t pids < <(_pstree_pids "$VNG_PID")
+        if kill -0 "$QEMU_PID" 2>/dev/null; then
+            mapfile -t pids < <(_pstree_pids "$QEMU_PID")
             for pid in "${pids[@]}"; do
                 kill -9 "$pid" 2>/dev/null
             done
         fi
-        wait "$VNG_PID" 2>/dev/null
+        wait "$QEMU_PID" 2>/dev/null
     fi
 
     # Remove session file after shutdown so the VM remains discoverable
     # by 'join'/'list' if the kill above fails for any reason.
-    if [ -n "${SESSION_NAME:-}" ] && [ -n "${VNG_PID:-}" ]; then
-        remove_session "$SESSION_NAME" "$VNG_PID"
+    if [ -n "${SESSION_NAME:-}" ] && [ -n "${QEMU_PID:-}" ]; then
+        remove_session "$SESSION_NAME" "$QEMU_PID"
     fi
 }
 
@@ -561,7 +620,7 @@ find_config_file() {
 #   _cfg_memory    - VM memory (e.g. "2G"), empty if not set
 #   _cfg_cpus      - VM CPU count, empty if not set
 #   _cfg_network   - "0" if network: false, empty if not set
-#   _cfg_ssh_key   - path to SSH key, empty if not set
+#   _cfg_exports_cow - array of cow export paths from config
 load_config() {
     local config_file="$1"
 
@@ -576,7 +635,6 @@ load_config() {
     #   memory=<value>
     #   cpus=<value>
     #   network=<value>
-    #   ssh_key=<value>
     #   __EXPORT_RO__
     #   <path>          (one per line)
     #   __EXPORT_RW__
@@ -592,7 +650,7 @@ load_config() {
         "memory="    + (.vm.memory // ""),
         "cpus="      + ((.vm.cpus // "") | tostring),
         "network="   + (.vm.network | tostring),
-        "ssh_key="   + (.ssh_key // ""),
+
         "__EXPORT_RO__",
         (.["export-ro"] // [] | .[]),
         "__EXPORT_RW__",
@@ -603,7 +661,7 @@ load_config() {
 
     # Parse the blob line by line — zero additional forks.
     local section="" line
-    local raw_cpus="" raw_network="" raw_key=""
+    local raw_cpus="" raw_network=""
     while IFS= read -r line; do
         case "$line" in
             __SCALARS__|__EXPORT_RO__|__EXPORT_RW__|__KEYS__)
@@ -620,7 +678,7 @@ load_config() {
                     memory)    _cfg_memory="$val" ;;
                     cpus)      raw_cpus="$val" ;;
                     network)   raw_network="$val" ;;
-                    ssh_key)   raw_key="$val" ;;
+
                 esac
                 ;;
             __EXPORT_RO__)
@@ -637,7 +695,7 @@ load_config() {
                 ;;
             __KEYS__)
                 [ -z "$line" ] && continue
-                local _known_keys=" container command export-ro export-rw vm vm.memory vm.cpus vm.network ssh_key "
+                local _known_keys=" container command export-ro export-rw vm vm.memory vm.cpus vm.network "
                 if [[ "$_known_keys" != *" $line "* ]]; then
                     warn "unknown config key '$line' in $config_file"
                 fi
@@ -651,12 +709,7 @@ load_config() {
     if [ "$raw_network" = "false" ]; then
         _cfg_network="0"
     fi
-    if [ -n "$raw_key" ]; then
-        raw_key="${raw_key/#\~\//$HOME/}"
-        if [ ! -f "$raw_key" ]; then
-            die "ssh_key not found: $raw_key (from $config_file)"
-        fi
-        _cfg_ssh_key="$raw_key"
+
     fi
 }
 
@@ -666,13 +719,13 @@ usage() {
     cat <<EOF
 Usage: $PROGNAME <command> [options]
 
-Run toolbox containers in VMs via virtme-ng.
+Run toolbox containers in VMs via qemu.
 
 Commands:
   enter <name>    Export a toolbox container and enter it as a VM
   join [<name>]   Open a new SSH session to a running VM
-  list            Show cached rootfs entries and their freshness status
-  clean [<name>]  Remove cached rootfs entries
+  list            Show cached VM images and their freshness status
+  clean [<name>]  Remove cached VM images
 
 Run '$PROGNAME <command> --help' for more information on a command.
 EOF
@@ -682,29 +735,28 @@ usage_enter() {
     cat <<EOF
 Usage: $PROGNAME enter [<name>] [options]
 
-Export the toolbox container <name> to a local rootfs and boot it as a VM
-using virtme-ng. The VM is started in the background and connected to via
+Export the toolbox container <name> to a qcow2 disk image and boot it as
+a VM using qemu. The VM is started in the background and connected to via
 SSH. The current directory is mounted read-write inside the VM.
 
 If <name> is omitted, the 'container' field from the config file is used.
 
 The container must have these packages installed:
-  openssh-server, systemd-udev, busybox
-
-Requires SSH public keys in ~/.ssh/id_*.pub for authentication.
+  openssh-server, systemd-udev, dbus-broker
 
 Options:
   --export-ro <path>  Additional host path to make available in the VM (repeatable)
                       Directories are mounted read-only at their original path.
                       Files are copied into the VM at their original path.
   --export-rw <path>  Like --export-ro, but directories are mounted read-write
-  --refresh         Force re-export of the rootfs even if it appears fresh
+  --refresh         Force re-export of the image even if it appears fresh
   --deep-check      Use 'podman diff' for thorough staleness detection
   --memory <size>   VM memory, e.g. 4G, 512M (default: 4G)
   --cpus <n>        VM CPU count (default: host CPU count)
   --command <cmd>   Run <cmd> in the VM instead of an interactive shell
   --config <path>   Use <path> as config file instead of searching for one
   --no-network      Disable the extra network device (SSH network device remains)
+  --console         Boot with serial console on stdio instead of SSH (for debugging)
   --verbose         Show VM boot output
   -h, --help        Show this help
 
@@ -726,7 +778,6 @@ Configuration file:
       memory: 8G
       cpus: 4
       network: false
-    ssh_key: ~/.ssh/id_ed25519
 EOF
 }
 
@@ -753,12 +804,12 @@ EOF
 
 # Write metadata file after a successful export
 write_meta() {
-    local rootfs_dir="$1"
+    local cache_dir="$1"
     local image_id="$2"
     local container_id="$3"
     local inspect_hash="$4"
 
-    cat > "$rootfs_dir/$META_FILE" <<EOF
+    cat > "$cache_dir/$META_FILE" <<EOF
 image_id=$image_id
 container_id=$container_id
 inspect_hash=$inspect_hash
@@ -768,9 +819,9 @@ EOF
 
 # Read a key from the metadata file. Returns empty string if missing.
 read_meta() {
-    local rootfs_dir="$1"
+    local cache_dir="$1"
     local key="$2"
-    local meta_path="$rootfs_dir/$META_FILE"
+    local meta_path="$cache_dir/$META_FILE"
 
     if [ ! -f "$meta_path" ]; then
         return 0
@@ -787,7 +838,6 @@ read_meta() {
 }
 
 # Gather current container state and return as key=value lines.
-# Merges two podman inspect --format calls into one (3 → 2 total).
 gather_container_state() {
     local name="$1"
 
@@ -806,10 +856,7 @@ gather_container_state() {
         die "failed to get container ID for '$name'"
     fi
 
-    # Hash the full JSON for change detection.  This is a second
-    # podman inspect, but the alternative (parsing JSON in bash) is
-    # worse.  The original code used three separate calls and checked
-    # $? of cut (always 0) instead of podman inspect.
+    # Hash the full JSON for change detection.
     local inspect_hash_raw
     inspect_hash_raw=$(podman inspect "$name" 2>/dev/null | sha256sum)
     local inspect_hash="${inspect_hash_raw%%[[:space:]]*}"
@@ -823,22 +870,22 @@ gather_container_state() {
     echo "inspect_hash=$inspect_hash"
 }
 
-# Check whether the cached rootfs is fresh.
+# Check whether the cached image is fresh.
 # Returns 0 if fresh, 1 if stale or missing.
 check_freshness() {
     local name="$1"
-    local rootfs_dir="$2"
+    local cache_dir="$2"
     local deep_check="$3"
 
-    if [ ! -d "$rootfs_dir" ] || [ ! -f "$rootfs_dir/$META_FILE" ]; then
-        info "no cached rootfs found for '$name'"
+    if [ ! -d "$cache_dir" ] || [ ! -f "$cache_dir/$META_FILE" ] || [ ! -f "$cache_dir/$name.qcow2" ]; then
+        info "no cached image found for '$name'"
         return 1
     fi
 
     local stored_image_id stored_container_id stored_inspect_hash
-    stored_image_id=$(read_meta "$rootfs_dir" "image_id")
-    stored_container_id=$(read_meta "$rootfs_dir" "container_id")
-    stored_inspect_hash=$(read_meta "$rootfs_dir" "inspect_hash")
+    stored_image_id=$(read_meta "$cache_dir" "image_id")
+    stored_container_id=$(read_meta "$cache_dir" "container_id")
+    stored_inspect_hash=$(read_meta "$cache_dir" "inspect_hash")
 
     # Gather current state
     local current_state
@@ -874,12 +921,12 @@ check_freshness() {
         diff_hash_raw=$(podman diff "$name" 2>/dev/null | sha256sum)
         local diff_hash="${diff_hash_raw%%[[:space:]]*}"
         if [ -z "$diff_hash" ]; then
-            warn "podman diff failed, treating rootfs as stale"
+            warn "podman diff failed, treating image as stale"
             return 1
         fi
 
         local stored_diff_hash
-        stored_diff_hash=$(read_meta "$rootfs_dir" "diff_hash")
+        stored_diff_hash=$(read_meta "$cache_dir" "diff_hash")
 
         if [ "$stored_diff_hash" != "$diff_hash" ]; then
             info "filesystem changes detected in '$name'"
@@ -890,226 +937,482 @@ check_freshness() {
     return 0
 }
 
-# ── Kernel modules ──────────────────────────────────────────────────────────
+# ── Host kernel/initramfs detection ─────────────────────────────────────────
 
-# Copy the host's kernel modules for virtio_net into the exported rootfs.
-# The VM boots the host kernel, but the initramfs only includes modules
-# for 9p/virtiofs. virtio_net (needed for networking) must be available
-# in the rootfs so udevd can load it during coldplug.
-install_vm_modules() {
-    local rootfs_dir="$1"
+# Locate the kernel image for the running kernel.
+# The file must be readable by the current user.
+find_host_kernel() {
     local kver
     kver=$(uname -r)
-    local host_moddir="/lib/modules/$kver"
-    local rootfs_moddir="$rootfs_dir/usr/lib/modules/$kver"
-
-    if [ ! -d "$host_moddir" ]; then
-        warn "host kernel modules not found at $host_moddir — networking may not work"
-        return
-    fi
-
-    # Skip if we've already installed modules (check for our marker file)
-    if [ -f "$rootfs_moddir/.schupfn-modules" ]; then
-        return
-    fi
-
-    info "installing kernel modules ($kver) into rootfs"
-
-    # Copy virtio_net and its dependencies. Collect all source→dest
-    # pairs first, then do a single podman unshare call to copy them
-    # all (each podman unshare creates a user namespace, so batching
-    # saves significant overhead).
-    local -a mod_pairs=()
-    while IFS= read -r line; do
-        local mod_path="${line#insmod }"
-        mod_path="${mod_path%%[[:space:]]*}"
-        if [ -f "$mod_path" ]; then
-            local rel_path="${mod_path#/lib/modules/$kver/}"
-            mod_pairs+=("$mod_path" "$rootfs_moddir/$rel_path")
+    local -a candidates=(
+        "/lib/modules/$kver/vmlinuz"
+        "/boot/vmlinuz-$kver"
+        "/boot/vmlinuz"
+    )
+    for path in "${candidates[@]}"; do
+        if [ -r "$path" ]; then
+            echo "$path"
+            return 0
         fi
-    done < <(modprobe --show-depends virtio_net 2>/dev/null)
+    done
+    die "cannot find a readable kernel image for $kver." \
+        "Looked in: ${candidates[*]}" \
+        "On Fedora, /boot files are often root-only;" \
+        "/lib/modules/$kver/vmlinuz is typically world-readable."
+}
 
-    # Single podman unshare: create directories, copy modules, leave marker.
-    podman unshare bash -c '
-        rootfs_moddir="$1"; shift
-        while [ $# -ge 2 ]; do
-            mkdir -p "${2%/*}"
-            cp "$1" "$2"
-            shift 2
-        done
-        touch "$rootfs_moddir/.schupfn-modules"
-    ' _ "$rootfs_moddir" "${mod_pairs[@]}"
-
-    # Generate modules.dep so modprobe can resolve dependencies
-    depmod -a -b "$rootfs_dir" "$kver" 2>/dev/null
+# Locate the initramfs for the running kernel.
+# Returns the path if found and readable, or empty string if none is
+# available. An initramfs is optional when the kernel has virtio_blk,
+# virtio_pci, and the root filesystem driver (ext4) built in — which
+# is the case on Fedora and most distribution kernels.
+find_host_initramfs() {
+    local kver
+    kver=$(uname -r)
+    local -a candidates=(
+        "/boot/initramfs-$kver.img"
+        "/boot/initrd.img-$kver"
+        "/boot/initrd-$kver.img"
+        "/boot/initrd-$kver"
+        "/boot/initramfs.img"
+    )
+    for path in "${candidates[@]}"; do
+        if [ -r "$path" ]; then
+            echo "$path"
+            return 0
+        fi
+    done
+    # Not found — caller decides whether this is fatal
+    return 0
 }
 
 # ── Export ───────────────────────────────────────────────────────────────────
 
-# Ensure the current user exists in the rootfs's /etc/passwd and /etc/group.
-# Toolbox containers create the user at runtime, but podman export captures
-# a static snapshot that typically only has system users.
-prepare_rootfs_user() {
-    local rootfs_dir="$1"
+# Build the guest-side systemd service unit that mounts 9p shares.
+# The service reads /proc/cmdline for schupfn.9p=<tag>:<path>:<mode>
+# entries and mounts each one.
+#
+# The 9p kernel modules (9p, 9pnet, 9pnet_virtio) must be loaded before
+# any 9p mount can succeed.  We handle this by loading them via modprobe
+# first — this works because:
+#   - If the modules are built-in: modprobe succeeds silently
+#   - If the modules are loadable: we need /lib/modules to be mounted,
+#     but /lib/modules is itself a 9p mount (circular dependency).
+#     To break the circle, the host kernel modules directory is passed
+#     as a kernel built-in 9p mount tag.  We mount that first using
+#     insmod on the module files from the disk image (which were
+#     installed by virt-customize), then modprobe works for everything.
+generate_mount_script() {
+    cat <<'SCRIPT'
+#!/bin/bash
+modprobe 9pnet_virtio 2>/dev/null
+modprobe 9p 2>/dev/null
+sleep 0.5
+
+# Parse kernel command line
+schupfn_user=""
+schupfn_home=""
+for param in $(cat /proc/cmdline); do
+    case "$param" in
+        schupfn.user=*) schupfn_user="${param#schupfn.user=}" ;;
+        schupfn.home=*) schupfn_home="${param#schupfn.home=}" ;;
+        schupfn.9p=*)
+            spec="${param#schupfn.9p=}"
+            tag="${spec%%:*}"; rest="${spec#*:}"
+            path="${rest%%:*}"; mode="${rest#*:}"
+            mkdir -p "$path"
+            # Fix ownership of all intermediate dirs created by mkdir -p
+            # (e.g. mkdir -p ~/.local/bin creates ~/.local as root:root,
+            # which prevents the user from creating ~/.local/share later)
+            if [ -n "$schupfn_home" ] && [ -n "$schupfn_user" ]; then
+                _uid=$(id -u "$schupfn_user" 2>/dev/null) || true
+                _gid=$(id -g "$schupfn_user" 2>/dev/null) || true
+                if [ -n "$_uid" ] && [ -n "$_gid" ]; then
+                    p="$path"
+                    while [ "$p" != "/" ] && [ -n "$p" ]; do
+                        case "$p" in "$schupfn_home"/*) chown "$_uid:$_gid" "$p" 2>/dev/null ;; esac
+                        p=$(dirname "$p")
+                    done
+                fi
+            fi
+            opts="trans=virtio,version=9p2000.L,msize=104857600"
+            [ "$mode" = "ro" ] && opts="$opts,ro"
+            mounted=0
+            for i in 1 2 3; do
+                if mount -t 9p -o "$opts" "$tag" "$path" 2>/dev/null; then
+                    mounted=1; break
+                fi
+                sleep 0.5
+            done
+            if [ "$mounted" = "0" ]; then
+                echo "schupfn-mounts: failed to mount $tag at $path" >&2
+            fi
+            ;;
+    esac
+done
+
+# Fix home directory ownership.  The container export produces files
+# owned by root; this fixes them to the actual user.  Runs at boot
+# as real root (not in a user namespace), so it always works.
+if [ -n "$schupfn_user" ] && [ -n "$schupfn_home" ] && [ -d "$schupfn_home" ]; then
+    uid=$(id -u "$schupfn_user" 2>/dev/null)
+    gid=$(id -g "$schupfn_user" 2>/dev/null)
+    if [ -n "$uid" ] && [ -n "$gid" ]; then
+        chown -R "$uid:$gid" "$schupfn_home"
+    fi
+fi
+SCRIPT
+}
+
+generate_mount_service() {
+    cat <<'UNIT'
+[Unit]
+Description=Mount schupfn 9p shares
+DefaultDependencies=no
+After=systemd-tmpfiles-setup.service systemd-udevd.service
+Before=multi-user.target sshd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/schupfn-mounts.sh
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+}
+
+export_image() {
+    local name="$1"
+    local cache_dir="$2"
+
+    info "exporting container '$name' to disk image..."
+
+    # Remove old image if it exists
+    if [ -d "$cache_dir" ]; then
+        rm -rf "$cache_dir"
+    fi
+
+    mkdir -p -m 0700 "$cache_dir"
+
+    # Generate a dedicated ed25519 keypair for this image.
+    local image_key="$cache_dir/ssh_key"
+    ssh-keygen -t ed25519 -f "$image_key" -N "" -q \
+        || die "failed to generate SSH key for image"
+
+    local tarball="$cache_dir/$name.tar"
+    local image="$cache_dir/$name.qcow2"
+
+    # Prepare the user entry
     local username
     username=$(whoami)
-
     local uid gid homedir shell
     uid=$(id -u)
     gid=$(id -g)
     homedir="$HOME"
     shell=$(getent passwd "$username" | cut -d: -f7)
     shell="${shell:-/bin/bash}"
-
     local groupname
     groupname=$(id -gn)
 
-    local passwd_file="$rootfs_dir/etc/passwd"
-    local group_file="$rootfs_dir/etc/group"
+    local host_tz
+    host_tz=$(timedatectl show -p Timezone --value 2>/dev/null \
+        || cat /etc/timezone 2>/dev/null || echo "UTC")
 
-    # Add group if not present
-    if ! grep -q "^${groupname}:" "$group_file" 2>/dev/null; then
-        info "adding group '$groupname' (gid $gid) to rootfs"
-        echo "${groupname}:x:${gid}:" >> "$group_file"
-    fi
+    local kver
+    kver=$(uname -r)
 
-    # Use /bin/bash if the user's shell doesn't exist in the rootfs
-    if [ ! -x "$rootfs_dir$shell" ]; then
-        shell=/bin/bash
-    fi
+    # ── Phase 1: prepare the container with buildah ─────────────────────
+    #
+    # Use buildah to create a working container from the toolbox
+    # container's image, apply all configuration changes, then export.
+    # This runs inside the container's filesystem (no helper VM needed),
+    # so it's fast and the operations happen in the right context.
+    # The only things that can't be done here are setuid/ownership
+    # fixes — those need real root (virt-customize phase).
 
-    # Add user if not present
-    if ! grep -q "^${username}:" "$passwd_file" 2>/dev/null; then
-        info "adding user '$username' (uid $uid) to rootfs"
-        echo "${username}:x:${uid}:${gid}::${homedir}:${shell}" >> "$passwd_file"
-    fi
+    info "preparing container filesystem..."
 
-    # Ensure home directory exists
-    mkdir -p "$rootfs_dir$homedir"
-}
+    # Commit the container's current filesystem (including all packages
+    # installed by the user) to a temporary image, then create a buildah
+    # working container from it.  We can't use the container's base
+    # image directly because it doesn't include user-installed packages.
+    local tmp_image="localhost/schupfn-tmp-$name"
+    podman commit "$name" "$tmp_image" >/dev/null 2>&1 \
+        || die "failed to commit container '$name' to temporary image"
 
-# Wrap sshd so it fixes the privsep directory ownership before starting.
-# On a 9p rootfs all files appear as the host user's UID, but sshd
-# requires /usr/share/empty.sshd to be owned by root. The wrapper
-# bind-mounts a tmpfs over it (which IS root-owned) before exec'ing
-# the real sshd binary.
-fix_sshd_privsep() {
-    local rootfs_dir="$1"
-    local sshd_path="$rootfs_dir/usr/sbin/sshd"
-    local sshd_real="$rootfs_dir/usr/sbin/sshd.real"
+    local wc
+    wc=$(buildah from "$tmp_image" 2>/dev/null) \
+        || { podman rmi "$tmp_image" >/dev/null 2>&1; die "failed to create buildah working container"; }
 
-    # Skip if already wrapped
-    if [ -f "$sshd_real" ]; then
-        return
-    fi
+    # Helper to run commands in the working container
+    _brun() { buildah run --env PATH=/usr/sbin:/usr/bin:/sbin:/bin "$wc" -- "$@"; }
 
-    if [ ! -f "$sshd_path" ]; then
-        return
-    fi
+    # Helper to write a file into the container from a string
+    _bwrite() {
+        local dest="$1" mode="${2:-0644}"
+        local tmp
+        tmp=$(mktemp)
+        cat > "$tmp"
+        buildah copy --chmod "$mode" "$wc" "$tmp" "$dest" >/dev/null
+        rm -f "$tmp"
+    }
 
-    # Rename the real sshd and install a wrapper.
-    # Need podman unshare because /usr/sbin is dr-xr-xr-x.
-    podman unshare mv "$sshd_path" "$sshd_real"
-    podman unshare bash -c 'cat > "$1"' _ "$sshd_path" <<'WRAPPER'
-#!/bin/bash
-# schupfn: sshd wrapper to fix privsep directory ownership on 9p rootfs
-privsep_dir=/usr/share/empty.sshd
-if [ -d "$privsep_dir" ]; then
-    mount -t tmpfs -o size=4k,mode=0755 tmpfs "$privsep_dir" 2>/dev/null
-fi
-exec /usr/sbin/sshd.real "$@"
-WRAPPER
-    podman unshare chmod +x "$sshd_path"
-}
+    # ── Container-to-VM transition fixes ────────────────────────────────
 
-# Fix permissions on files that need special modes to function correctly
-# inside the VM.  The exported rootfs is extracted by an unprivileged user,
-# so setuid bits are lost and some binaries have restrictive modes that
-# prevent overlayfs copy-up (which needs to read the file content).
-#
-# Uses podman unshare to operate in a user namespace where we are root,
-# allowing us to chmod files in directories that are dr-xr-xr-x.
-fix_rootfs_permissions() {
-    local rootfs_dir="$1"
+    _brun rm -f /.dockerenv
+    _brun rm -f /etc/systemd/system/service.d/00-container.conf
+    _brun rm -f /etc/systemd/system.conf.d/00-container.conf
+    _brun bash -c 'sed -i "/^container=/d" /etc/environment 2>/dev/null || true'
 
-    # sudo: needs to be readable (for overlayfs copy-up) and its
-    # directories need write permission (for RPM to install into them).
-    # The setuid bit cannot be preserved on 9p with security_model=none,
-    # but making the binary readable allows the in-VM copy-up fixup to
-    # work.
-    podman unshare bash -c '
-        rootfs="$1"
-        # Make key system directories writable so overlayfs copy-up
-        # produces directories that root can write to inside the VM.
-        for d in usr/bin usr/sbin usr/lib usr/lib64 usr/libexec usr/include; do
-            [ -d "$rootfs/$d" ] && chmod 0755 "$rootfs/$d"
-        done
-        # Make setuid/setgid binaries readable so overlayfs can copy
-        # them up.  The setuid bit itself is lost on 9p, but readability
-        # allows the in-VM fixup to restore it.
-        find "$rootfs/usr" -type f \( -perm /4000 -o -perm /2000 \) -exec chmod a+r {} +
-        # Also fix any execute-only binaries (e.g. sudo is ---x--x--x
-        # on some distros) that would block overlayfs copy-up.
-        find "$rootfs/usr" -type f -perm /0111 ! -perm /0444 -exec chmod a+r {} +
-    ' _ "$rootfs_dir"
-}
+    # Fix dangling symlinks from toolbox host bind-mounts
+    _brun bash -c 'if [ -L /etc/resolv.conf ]; then rm -f /etc/resolv.conf; echo "nameserver 10.0.2.3" > /etc/resolv.conf; fi'
+    _brun bash -c "if [ -L /etc/localtime ]; then rm -f /etc/localtime; ln -s '/usr/share/zoneinfo/$host_tz' /etc/localtime; fi"
 
-export_rootfs() {
-    local name="$1"
-    local rootfs_dir="$2"
+    # SELinux: set to permissive (container labels are wrong for a VM)
+    _brun bash -c 'if [ -f /etc/selinux/config ]; then sed -i "s/^SELINUX=.*/SELINUX=permissive/" /etc/selinux/config; fi'
 
-    info "exporting container '$name' to $rootfs_dir ..."
+    # Mask problematic systemd units
+    _brun ln -sf /dev/null /etc/systemd/system/tmp.mount
+    _brun bash -c 'mkdir -p /tmp && chmod 1777 /tmp'
 
-    # Remove old rootfs if it exists. Use podman unshare to get root
-    # in the user namespace — the exported rootfs contains directories
-    # without write permission (e.g. /usr/lib64 is dr-xr-xr-x) that
-    # a regular rm cannot remove.
-    if [ -d "$rootfs_dir" ]; then
-        podman unshare rm -rf "$rootfs_dir"
-        if [ $? -ne 0 ]; then
-            die "failed to remove old rootfs at '$rootfs_dir'"
+    # ── D-Bus ───────────────────────────────────────────────────────────
+
+    _brun bash -c 'mkdir -p /etc/systemd/system/multi-user.target.wants /etc/systemd/system/sockets.target.wants'
+    _brun bash -c 'if [ -f /usr/lib/systemd/system/dbus-broker.service ]; then ln -sf /usr/lib/systemd/system/dbus-broker.service /etc/systemd/system/multi-user.target.wants/; else ln -sf /usr/lib/systemd/system/dbus.service /etc/systemd/system/multi-user.target.wants/ 2>/dev/null; fi || true'
+    _brun bash -c 'ln -sf /usr/lib/systemd/system/dbus.socket /etc/systemd/system/sockets.target.wants/ 2>/dev/null || true'
+
+    # ── Kernel modules ──────────────────────────────────────────────────
+
+    local host_moddir="/lib/modules/$kver"
+    if [ -d "$host_moddir" ]; then
+        local mod_tar
+        mod_tar=$(mktemp --suffix=.tar)
+        local -a mod_files=()
+        while IFS= read -r line; do
+            local mod_path="${line#insmod }"
+            mod_path="${mod_path%%[[:space:]]*}"
+            [ -f "$mod_path" ] && mod_files+=("${mod_path#/}")
+        done < <(modprobe --show-depends 9pnet_virtio 2>/dev/null; \
+                 modprobe --show-depends 9p 2>/dev/null; \
+                 modprobe --show-depends virtio_net 2>/dev/null)
+
+        if [ ${#mod_files[@]} -gt 0 ]; then
+            tar -cf "$mod_tar" -C / "${mod_files[@]}" 2>/dev/null
+            buildah copy "$wc" "$mod_tar" /tmp/schupfn-modules.tar >/dev/null
+            rm -f "$mod_tar"
+            _brun bash -c 'tar -xf /tmp/schupfn-modules.tar -C / && rm -f /tmp/schupfn-modules.tar'
+            _brun /usr/sbin/depmod -a "$kver" 2>/dev/null || true
+        else
+            rm -f "$mod_tar"
         fi
     fi
 
-    # Use restrictive permissions so other users cannot read the rootfs
-    # contents (container filesystem, passwd/group entries, config, etc.)
-    mkdir -p -m 0700 "$rootfs_dir"
-    if [ $? -ne 0 ]; then
-        die "failed to create directory '$rootfs_dir'"
+    _brun bash -c 'mkdir -p /etc/modules-load.d && echo virtio_net > /etc/modules-load.d/schupfn.conf'
+
+    # ── SSH setup ───────────────────────────────────────────────────────
+
+    # Remove stale host keys and regenerate
+    _brun bash -c 'rm -f /etc/ssh/ssh_host_*key* && ssh-keygen -A'
+
+    # Disable all stock sshd mechanisms
+    _brun bash -c 'rm -f /etc/systemd/system/multi-user.target.wants/sshd.service 2>/dev/null || true'
+    _brun ln -sf /dev/null /etc/systemd/system/sshd.socket
+    _brun ln -sf /dev/null /etc/systemd/system/sshd@.service
+    _brun bash -c 'mkdir -p /etc/systemd/system-generators && ln -sf /dev/null /etc/systemd/system-generators/systemd-ssh-generator'
+
+    # Write our minimal sshd config
+    _bwrite /etc/ssh/sshd_config_schupfn 0644 <<'SSHD_CONF'
+Port 22
+PermitRootLogin prohibit-password
+PubkeyAuthentication yes
+PubkeyAcceptedAlgorithms +ssh-rsa
+AuthorizedKeysFile .ssh/authorized_keys
+PasswordAuthentication no
+UsePAM no
+UseDNS no
+GSSAPIAuthentication no
+X11Forwarding no
+PrintMotd no
+AcceptEnv LANG LC_*
+Subsystem sftp /usr/libexec/openssh/sftp-server
+SSHD_CONF
+
+    # Write the schupfn-sshd systemd service
+    _bwrite /etc/systemd/system/schupfn-sshd.service 0644 <<'SSHD_SVC'
+[Unit]
+Description=schupfn SSH server
+After=network.target sshd-keygen.target schupfn-network.service
+Wants=sshd-keygen.target
+
+[Service]
+ExecStart=/usr/sbin/sshd -D -f /etc/ssh/sshd_config_schupfn -e
+Restart=on-failure
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target
+SSHD_SVC
+    # Enable services by creating symlinks directly (systemctl needs
+    # D-Bus which isn't running inside a buildah container)
+    _brun bash -c 'mkdir -p /etc/systemd/system/multi-user.target.wants && ln -sf /etc/systemd/system/schupfn-sshd.service /etc/systemd/system/multi-user.target.wants/'
+
+    # ── User setup ──────────────────────────────────────────────────────
+
+    _brun bash -c "grep -q '^${groupname}:' /etc/group || echo '${groupname}:x:${gid}:' >> /etc/group"
+    _brun bash -c "grep -q '^${username}:' /etc/passwd || echo '${username}:x:${uid}:${gid}::${homedir}:${shell}' >> /etc/passwd"
+    _brun mkdir -p "$homedir/.ssh"
+
+    # Inject SSH authorized keys
+    {
+        cat "${image_key}.pub"
+        for pub in "$HOME"/.ssh/id_*.pub; do
+            [ -f "$pub" ] && cat "$pub"
+        done
+    } | _bwrite "${homedir}/.ssh/authorized_keys" 0600
+
+    # Also inject for root
+    _brun mkdir -p /root/.ssh
+    _brun chmod 700 /root/.ssh
+    {
+        cat "${image_key}.pub"
+        for pub in "$HOME"/.ssh/id_*.pub; do
+            [ -f "$pub" ] && cat "$pub"
+        done
+    } | _bwrite /root/.ssh/authorized_keys 0600
+
+    _brun chmod 700 "${homedir}/.ssh"
+
+    # ── 9p mount script + service ───────────────────────────────────────
+
+    local mount_script_tmp mount_service_tmp
+    mount_script_tmp=$(mktemp)
+    mount_service_tmp=$(mktemp)
+    # Ensure temp files are cleaned up on any exit from this function
+    trap 'rm -f "$mount_script_tmp" "$mount_service_tmp"' RETURN
+    generate_mount_script > "$mount_script_tmp"
+    generate_mount_service > "$mount_service_tmp"
+
+    buildah copy --chmod 0755 "$wc" "$mount_script_tmp" /usr/local/bin/schupfn-mounts.sh >/dev/null
+    buildah copy --chmod 0644 "$wc" "$mount_service_tmp" /etc/systemd/system/schupfn-mounts.service >/dev/null
+    _brun bash -c 'ln -sf /etc/systemd/system/schupfn-mounts.service /etc/systemd/system/multi-user.target.wants/'
+
+    # ── Network script + service ────────────────────────────────────────
+
+    _bwrite /usr/local/bin/schupfn-network.sh 0755 <<'NETSCRIPT'
+#!/bin/bash
+modprobe virtio_net 2>/dev/null
+for i in $(seq 1 20); do
+    iface=$(ls /sys/class/net/ 2>/dev/null | grep -v lo | head -1)
+    [ -n "$iface" ] && break
+    sleep 0.5
+done
+if [ -z "$iface" ]; then
+    echo "schupfn-network: no network interface found" >&2
+    exit 1
+fi
+ip addr add 10.0.2.15/24 dev "$iface" 2>/dev/null
+ip link set "$iface" up
+ip route add default via 10.0.2.2 dev "$iface" 2>/dev/null
+rm -f /etc/resolv.conf
+echo "nameserver 10.0.2.3" > /etc/resolv.conf
+echo "schupfn-network: configured $iface with 10.0.2.15/24"
+NETSCRIPT
+
+    _bwrite /etc/systemd/system/schupfn-network.service 0644 <<'NETSVC'
+[Unit]
+Description=schupfn network setup
+After=systemd-modules-load.service systemd-udevd.service
+Before=network.target schupfn-sshd.service
+Wants=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/schupfn-network.sh
+
+[Install]
+WantedBy=multi-user.target
+NETSVC
+    _brun bash -c 'ln -sf /etc/systemd/system/schupfn-network.service /etc/systemd/system/multi-user.target.wants/'
+    _brun bash -c 'rm -f /etc/systemd/system/multi-user.target.wants/systemd-networkd.service 2>/dev/null || true'
+
+    # ── Hostname ────────────────────────────────────────────────────────
+
+    # Set hostname — use buildah config instead of writing the file
+    # directly (avoids "Device or resource busy" on /etc/hostname)
+    buildah config --hostname "$name" "$wc" >/dev/null 2>&1 || true
+
+    # ── Export ──────────────────────────────────────────────────────────
+
+    info "exporting prepared container..."
+    local prepared_image="localhost/schupfn-prepared-$name"
+    if ! buildah commit --rm --squash "$wc" "$prepared_image" >/dev/null 2>&1; then
+        buildah rm "$wc" >/dev/null 2>&1
+        podman rmi "$tmp_image" >/dev/null 2>&1
+        die "failed to commit buildah container"
     fi
 
-    podman export "$name" | tar -xf - -C "$rootfs_dir"
-    local -a pipe_rc=("${PIPESTATUS[@]}")
-    if [ "${pipe_rc[0]}" -ne 0 ] || [ "${pipe_rc[1]}" -ne 0 ]; then
-        podman unshare rm -rf "$rootfs_dir"
-        die "failed to export container '$name'"
+    # Remove the temp image (no longer needed after commit)
+    podman rmi "$tmp_image" >/dev/null 2>&1
+
+    # Create a temporary container from the committed image and export it
+    local tmp_ctr
+    tmp_ctr=$(podman create "$prepared_image" /bin/true 2>/dev/null) \
+        || die "failed to create temporary export container"
+
+    if ! podman export "$tmp_ctr" > "$tarball"; then
+        podman rm "$tmp_ctr" >/dev/null 2>&1
+        podman rmi "$prepared_image" >/dev/null 2>&1
+        rm -f "$tarball"
+        die "failed to export container"
     fi
 
-    # Ensure the current user exists in the rootfs. Toolbox containers
-    # normally create the user at start time, but a podman-exported rootfs
-    # is a static snapshot that may not have it.
-    prepare_rootfs_user "$rootfs_dir"
+    podman rm "$tmp_ctr" >/dev/null 2>&1
+    podman rmi "$prepared_image" >/dev/null 2>&1
 
-    # Copy the host's kernel modules for virtio_net into the rootfs.
-    # The container has udevd (checked by check_container_prerequisites)
-    # which will load these modules during coldplug.
-    install_vm_modules "$rootfs_dir"
+    # ── Phase 2: create qcow2 image ────────────────────────────────────
 
-    # Fix sshd privilege separation directory. The rootfs is served via
-    # 9p with security_model=none, so all files appear as the host user's
-    # UID inside the VM. sshd requires its privsep directory to be owned
-    # by root. We wrap sshd with a script that bind-mounts a tmpfs (which
-    # IS owned by root) over the privsep directory before starting sshd.
-    fix_sshd_privsep "$rootfs_dir"
+    # Compute image size: tarball size + 50% headroom, minimum 2G
+    local tar_size_bytes
+    tar_size_bytes=$(stat --format='%s' "$tarball" 2>/dev/null) \
+        || tar_size_bytes=$(stat -f '%z' "$tarball" 2>/dev/null) \
+        || tar_size_bytes=0
+    local image_size_bytes=$(( tar_size_bytes * 3 / 2 ))
+    local min_size=$(( 2 * 1024 * 1024 * 1024 ))  # 2G
+    if [ "$image_size_bytes" -lt "$min_size" ]; then
+        image_size_bytes=$min_size
+    fi
+    local image_size_gb=$(( (image_size_bytes + 1073741823) / 1073741824 ))
+    local image_size="${image_size_gb}G"
 
-    # Fix file permissions in the exported rootfs.  The 9p filesystem
-    # with security_model=none presents files with the host user's UID
-    # and the original mode bits from the tar extraction.  Setuid binaries
-    # like sudo lose their setuid bit, and files with restrictive modes
-    # (e.g. ---x--x--x for sudo) cannot be copied up by overlayfs because
-    # the kernel cannot read the file content.  Fix the permissions in the
-    # rootfs before booting so that overlayfs copy-up works correctly.
-    fix_rootfs_permissions "$rootfs_dir"
+    info "creating ${image_size} qcow2 image..."
+    if ! virt-make-fs --format=qcow2 --type=ext4 --size="$image_size" \
+            "$tarball" "$image"; then
+        rm -f "$tarball" "$image"
+        die "failed to create disk image"
+    fi
+
+    rm -f "$tarball"
+
+    # ── Phase 3: fix permissions (needs real root) ──────────────────────
+    #
+    # Rootless podman export loses setuid bits and produces wrong
+    # file ownership.  virt-customize's SELinux relabelling pass can
+    # undo ownership changes, so we use two steps:
+    # 1. virt-customize for rpm --setperms/--setugids (needs a running
+    #    system with rpm database access)
+    # 2. guestfish for chown (direct filesystem access, no post-processing)
+
+    info "fixing permissions..."
+    if ! virt-customize -a "$image" --no-network --no-selinux-relabel \
+            --run-command 'chown -R root:root /etc' \
+            --run-command 'rpm --setperms -a 2>/dev/null || true' \
+            --run-command 'rpm --setugids -a 2>/dev/null || true'; then
+        die "failed to fix image permissions"
+    fi
+
+
 
     # Gather state and write metadata
     local state
@@ -1124,7 +1427,15 @@ export_rootfs() {
         esac
     done <<< "$state"
 
-    write_meta "$rootfs_dir" "$image_id" "$container_id" "$inspect_hash"
+    # Also compute and store the diff hash for --deep-check freshness
+    local diff_hash_raw
+    diff_hash_raw=$(podman diff "$name" 2>/dev/null | sha256sum)
+    local diff_hash="${diff_hash_raw%%[[:space:]]*}"
+
+    write_meta "$cache_dir" "$image_id" "$container_id" "$inspect_hash"
+    if [ -n "$diff_hash" ]; then
+        echo "diff_hash=$diff_hash" >> "$cache_dir/$META_FILE"
+    fi
 
     info "export complete"
 }
@@ -1139,7 +1450,7 @@ cmd_enter() {
     local cpus=""
     local network=""
     local verbose=0
-    local ssh_key=""
+    local console=0
     local command=""
     local cli_config=""
     local -a exports=()
@@ -1201,6 +1512,10 @@ cmd_enter() {
                 verbose=1
                 shift
                 ;;
+            --console)
+                console=1
+                shift
+                ;;
             -*)
                 die "unknown option: $1"
                 ;;
@@ -1222,7 +1537,7 @@ cmd_enter() {
     # Config values provide defaults; CLI arguments always take precedence.
     local -a _cfg_exports=()
     local -a _cfg_exports_rw=()
-    local _cfg_container="" _cfg_command="" _cfg_memory="" _cfg_cpus="" _cfg_network="" _cfg_ssh_key=""
+    local _cfg_container="" _cfg_command="" _cfg_memory="" _cfg_cpus="" _cfg_network=""
     local config_file
     if [ -n "$cli_config" ]; then
         if [ ! -f "$cli_config" ]; then
@@ -1254,7 +1569,6 @@ cmd_enter() {
     memory="${cli_memory:-${_cfg_memory:-4G}}"
     cpus="${cli_cpus:-${_cfg_cpus}}"
     network="${cli_network:-${_cfg_network:-1}}"
-    ssh_key="${_cfg_ssh_key}"
     if [ -z "$command" ]; then
         command="${_cfg_command}"
     fi
@@ -1269,55 +1583,53 @@ cmd_enter() {
     # Check that the container has required packages installed
     check_container_prerequisites "$name"
 
-    local rootfs_dir="$CACHE_DIR/$name"
+    local cache_dir="$CACHE_DIR/$name"
 
     # Check freshness (unless --refresh forces re-export)
     local need_export=0
     if [ "$refresh" = "1" ]; then
         info "forced refresh requested"
         need_export=1
-    elif ! check_freshness "$name" "$rootfs_dir" "$deep_check"; then
+    elif ! check_freshness "$name" "$cache_dir" "$deep_check"; then
         need_export=1
     else
-        info "rootfs for '$name' is up to date"
+        info "image for '$name' is up to date"
     fi
 
     if [ "$need_export" = "1" ]; then
-        export_rootfs "$name" "$rootfs_dir"
+        export_image "$name" "$cache_dir"
+    fi
+
+    local image="$cache_dir/$name.qcow2"
+    if [ ! -f "$image" ]; then
+        die "disk image not found at $image"
     fi
 
     # Resolve $PWD to its physical path so the 9p mount uses a real
-    # directory, not a symlink.  Keep the logical path for virtme_chdir
-    # so the user lands in the expected directory.
+    # directory, not a symlink. Keep the logical path so the user lands
+    # in the expected directory.
     local physical_pwd
     if ! physical_pwd="$(realpath "$PWD" 2>/dev/null)" || [ -z "$physical_pwd" ]; then
         die "cannot resolve current directory '$PWD' —" \
             "it may have been deleted or permissions are insufficient."
     fi
 
-    # Refuse to run from $HOME: mounting it via --rwdir (9p) would shadow
-    # the --overlay-rwdir on /home, causing everything under $HOME to sit
-    # on 9p. Applications that need POSIX file locking or mmap (e.g.
-    # SQLite WAL mode) will break.
-    # Resolve $HOME to its physical path so the check still works when
-    # $HOME itself is a symlink (e.g. /home/user -> /data/users/user).
-    local physical_home
-    physical_home="$(realpath "$HOME" 2>/dev/null)" || physical_home="$HOME"
-    if [ "$physical_pwd" = "$physical_home" ] || [ "$PWD" = "$HOME" ]; then
-        die "refusing to start from \$HOME — the 9p mount would shadow" \
-            "the overlay on /home and break applications that need" \
-            "POSIX file locking. Please cd to a subdirectory first."
+    # Paths with spaces or colons cannot be passed via the kernel command
+    # line (parsed by word-splitting in the guest mount script).
+    if [[ "$physical_pwd" == *" "* || "$physical_pwd" == *$'\t'* || "$physical_pwd" == *":"* ]]; then
+        die "current directory path contains whitespace or colons, which is not supported: $physical_pwd"
+    fi
+    if [[ "$HOME" == *" "* || "$HOME" == *$'\t'* || "$HOME" == *":"* ]]; then
+        die "\$HOME contains whitespace or colons, which is not supported: $HOME"
     fi
 
     # Classify each --export-ro / --export-rw path as a directory or file.
-    # See classify_export() for details.
     local -a rw_mount_dirs=("$physical_pwd")   # $PWD is always read-write
     local -a ro_mount_dirs=()
     local -a rootfs_symlinks=()
     local -a dotfiles=()
 
-    # If $PWD is (or passes through) a symlink, recreate it in the rootfs
-    # so that virtme_chdir and the SSH "cd" both land in the right place.
+    # If $PWD is (or passes through) a symlink, remember the mapping
     if [ "$PWD" != "$physical_pwd" ]; then
         rootfs_symlinks+=("$PWD:$physical_pwd")
     fi
@@ -1331,162 +1643,277 @@ cmd_enter() {
 
     check_nested_export_conflicts
 
-    # Ensure mount points exist inside the rootfs so virtme-ng can
-    # set them up. The rootfs is used with --rw so this is persistent
-    # across runs (until re-exported).
-    local dir
-    for dir in "${rw_mount_dirs[@]}" "${ro_mount_dirs[@]}"; do
-        if ! mkdir -p "$rootfs_dir$dir"; then
-            die "failed to create mount point '$dir' in rootfs"
-        fi
-    done
+    # Find the host kernel and initramfs
+    local kernel initramfs
+    kernel=$(find_host_kernel)
+    initramfs=$(find_host_initramfs)
+    info "using kernel: $kernel"
+    if [ -n "$initramfs" ]; then
+        info "using initramfs: $initramfs"
+    else
+        info "no readable initramfs found (booting without one)"
+    fi
 
-    # Recreate symlinks in the rootfs so the original paths work
-    for entry in "${rootfs_symlinks[@]}"; do
-        local link_path="${entry%%:*}"
-        local target="${entry#*:}"
-        local rootfs_link="$rootfs_dir$link_path"
-        if [ ! -e "$rootfs_link" ]; then
-            mkdir -p "$(dirname "$rootfs_link")"
-            ln -s "$target" "$rootfs_link"
-        fi
-    done
+    # Pick a port for SSH
+    local ssh_port
+    ssh_port=$(find_free_port)
 
-    # Build vng command.
+    # Use the image's dedicated SSH key for connecting.  This is an
+    # ed25519 key generated during export_image and baked into the
+    # image's authorized_keys.  It always works regardless of the
+    # host's crypto-policy or what key types the user has.
+    local image_key="$cache_dir/ssh_key"
+    if [ ! -f "$image_key" ]; then
+        die "image SSH key not found at $image_key — try --refresh to rebuild the image"
+    fi
+
+    local -a key_args=(-i "$image_key")
+
+    # Create a snapshot of the image for this session so the base image
+    # stays clean. Each boot gets its own copy-on-write layer.
+    # The backing file path must be absolute for qemu-img.
+    local abs_image
+    abs_image="$(realpath "$image")"
+    local session_image="$cache_dir/$name-session-$$.qcow2"
+    if ! qemu-img create -f qcow2 -b "$abs_image" -F qcow2 "$session_image" >/dev/null 2>&1; then
+        die "failed to create session snapshot"
+    fi
+
+    local username
+    username=$(whoami)
+
+    # Build the kernel command line.
     #
-    # Key flags:
-    #   --force-9p: use 9p instead of virtiofs for the rootfs. virtiofs
-    #     causes hangs with --network due to virtio device conflicts.
-    #   --no-virtme-ng-init: use the bash init script which works
-    #     reliably with custom rootfs.
-    #   --overlay-rwdir: required for --rwdir guest paths when using --root.
-    #     We use a common ancestor (/home, /tmp, etc.) rather than / because
-    #     overlaying / causes the init to hang.
-    local -a vng_cmd=(
-        vng --run
-        --root "$rootfs_dir"
-        --rw
-        --force-9p
-        --no-virtme-ng-init
-        --memory "$memory"
-        --name "$name"
+    # enforcing=0: set SELinux to permissive at boot. The container
+    #   image has SELinux labels from the container context that are
+    #   wrong for a VM. Permissive mode prevents denials from blocking
+    #   services like sshd, dbus, and mount operations.
+    # systemd.condition-needs-update=: suppress "System Needs Update"
+    #   checks that can cause unnecessary firstboot-like behavior.
+    local -a kernel_args=(
+        "root=/dev/vda"
+        "rw"
+        "console=ttyS0,115200"
+        "init=/sbin/init"
+        "enforcing=0"
+        "systemd.condition-needs-update="
+        "schupfn.container=$name"
+        "schupfn.chdir=$PWD"
+        "schupfn.user=$username"
+        "schupfn.home=$HOME"
     )
 
+    if [ "$verbose" != "1" ]; then
+        kernel_args+=("quiet")
+    fi
+
+    # Build qemu command.
+    #
+    # -display none:  no GUI window
+    # -vga none:      no video device (saves memory, avoids display probes)
+    # -no-reboot:     exit on guest reboot/crash instead of looping
+    local -a qemu_cmd=(
+        qemu-system-x86_64
+        -enable-kvm
+        -cpu host
+        -m "$memory"
+        -display none
+        -vga none
+        -no-reboot
+        -kernel "$kernel"
+        -drive "file=$session_image,format=qcow2,if=virtio"
+    )
+
+    if [ -n "$initramfs" ]; then
+        qemu_cmd+=(-initrd "$initramfs")
+    fi
+
+    # Serial console setup depends on mode:
+    # --console: -nographic (serial on stdio, interactive)
+    # normal:    -serial file:... (log to file, no terminal interaction)
+    local serial_log="$cache_dir/serial.log"
+    if [ "$console" = "1" ]; then
+        qemu_cmd+=(-nographic)
+    else
+        qemu_cmd+=(-serial "file:$serial_log" -monitor none)
+    fi
+
     if [ -n "$cpus" ]; then
-        vng_cmd+=(--cpus "$cpus")
+        qemu_cmd+=(-smp "$cpus")
     fi
 
+    # Networking: user-mode (SLIRP) with SSH port forwarding.
+    # When the extra network device is enabled, we combine SSH port
+    # forwarding and internet access on a single netdev to avoid
+    # multi-NIC complications with DHCP and routing.
     if [ "$network" = "1" ]; then
-        vng_cmd+=(--network user)
+        qemu_cmd+=(
+            -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:${ssh_port}-:22"
+            -device "virtio-net-pci,netdev=net0"
+        )
+    else
+        qemu_cmd+=(
+            -netdev "user,id=net0,restrict=on,hostfwd=tcp:127.0.0.1:${ssh_port}-:22"
+            -device "virtio-net-pci,netdev=net0"
+        )
     fi
 
-    # Mount directories into the VM at their original paths.
-    # Each mount needs its parent to be covered by an --overlay-rwdir.
-    local -a overlay_dirs=()
-
+    # Mount directories into the VM via 9p at their original paths.
+    local fs_idx=0
     for dir in "${rw_mount_dirs[@]}"; do
+        local tag="schupfn_rw_${fs_idx}"
         info "exporting directory (rw): $dir"
-        vng_cmd+=(--rwdir "$dir=$dir")
-        add_overlay "$dir"
+        qemu_cmd+=(-virtfs "local,path=$dir,mount_tag=$tag,security_model=none,id=fs${fs_idx}")
+        kernel_args+=("schupfn.9p=${tag}:${dir}:rw")
+        fs_idx=$((fs_idx + 1))
     done
 
     for dir in "${ro_mount_dirs[@]}"; do
+        local tag="schupfn_ro_${fs_idx}"
         info "exporting directory (ro): $dir"
-        vng_cmd+=(--rodir "$dir=$dir")
-        add_overlay "$dir"
+        qemu_cmd+=(-virtfs "local,path=$dir,mount_tag=$tag,security_model=none,id=fs${fs_idx},readonly=on")
+        kernel_args+=("schupfn.9p=${tag}:${dir}:ro")
+        fs_idx=$((fs_idx + 1))
     done
 
-    # Overlay key system directories so the VM sees correct file ownership.
-    # The rootfs is served via 9p with security_model=none, meaning all
-    # files appear owned by the host user's UID. This breaks programs
-    # that require root ownership (sudo needs setuid-root, rpm/dnf need
-    # root-owned database files, PAM checks /etc/sudoers ownership, etc.).
-    # An overlayfs on top of 9p restores the original ownership from the
-    # container image for everything that is not written to at runtime.
-    for sysdir in /usr /var /etc; do
-        add_overlay "$sysdir"
-    done
-
-    for dir in "${overlay_dirs[@]}"; do
-        vng_cmd+=(--overlay-rwdir "$dir")
-    done
-
-    # Mount the host's kernel modules into the VM so it can load modules
-    # like virtio_net for networking. The VM uses the host kernel but
-    # the exported container rootfs doesn't have /lib/modules.
+    # Mount host kernel modules so the VM can load them (e.g. virtio_net)
     local kver
     kver=$(uname -r)
     if [ -d "/lib/modules/$kver" ]; then
-        vng_cmd+=(--rodir "/lib/modules/$kver=/lib/modules/$kver")
+        local tag="schupfn_kmod"
+        qemu_cmd+=(-virtfs "local,path=/lib/modules/$kver,mount_tag=$tag,security_model=none,id=fskmod,readonly=on")
+        kernel_args+=("schupfn.9p=${tag}:/lib/modules/${kver}:ro")
     fi
 
-    vng_cmd+=(--user "$(whoami)")
+    # Assemble kernel command line
+    local kernel_cmdline=""
+    for arg in "${kernel_args[@]}"; do
+        kernel_cmdline+="$arg "
+    done
+    qemu_cmd+=(-append "$kernel_cmdline")
 
-    # Set working directory inside the VM. We can't use --cwd because it
-    # rejects paths outside --root. Pass the kernel arg directly instead —
-    # the init script reads virtme_chdir and does cd to it.
-    vng_cmd+=(--append "virtme_chdir=$PWD")
-
-    # Tag the VM so processes inside can identify it as schupfn-started.
-    # Readable via: grep -o 'schupfn.container=[^ ]*' /proc/cmdline
-    vng_cmd+=(--append "schupfn.container=$name")
-
-    # Pick a port for SSH and enable the SSH server inside the VM.
-    # Use --ssh-tcp because the VM kernel typically lacks the vsock module.
-    local ssh_port
-    ssh_port=$(find_free_port)
-    vng_cmd+=(--ssh "$ssh_port" --ssh-tcp)
-
-    if [ "$verbose" = "1" ]; then
-        vng_cmd+=(--verbose)
+    # ── Console mode: run qemu in the foreground with serial on stdio ──
+    if [ "$console" = "1" ]; then
+        info "starting VM '$name' in console mode (Ctrl-A X to quit)..."
+        trap 'rm -f "$session_image"; cleanup_vm' EXIT
+        "${qemu_cmd[@]}"
+        rm -f "$session_image"
+        exit 0
     fi
 
+    # ── Normal mode: run qemu in the background, connect via SSH ─────
     info "starting VM '$name' (ssh port $ssh_port)..."
 
-    # Run vng in the background. Without --graphics, vng automatically
-    # adds -vga none -display none (no GUI window). The serial console
-    # is attached to the process's stdio; in verbose mode we show it on
-    # stderr, otherwise we redirect everything to /dev/null.
-    if [ "$verbose" = "1" ]; then
-        "${vng_cmd[@]}" </dev/null >&2 &
-    else
-        "${vng_cmd[@]}" </dev/null &>/dev/null &
-    fi
-    VNG_PID=$!
+    # Run qemu in the background.  Serial output goes to a file
+    # (-serial file:...) so there is no monitor on stdin and /dev/null
+    # is safe.  qemu's own stderr (e.g. device errors) goes to a log.
+    local qemu_log="$cache_dir/qemu.log"
+    QEMU_LOG="$qemu_log"
+    : > "$serial_log"  # truncate/create so tail -f doesn't fail
+    "${qemu_cmd[@]}" </dev/null >"$qemu_log" 2>&1 &
+    QEMU_PID=$!
     SESSION_NAME="$name"
 
     # Ensure we clean up the VM on exit (Ctrl-C, errors, normal exit)
-    trap cleanup_vm EXIT
+    trap 'rm -f "$session_image" "$serial_log"; cleanup_vm' EXIT
+
+    # In verbose mode, tail the serial console log on stderr so the
+    # user can see boot progress.  Kill the tail once SSH is up.
+    local tail_pid=""
+    if [ "$verbose" = "1" ]; then
+        tail -f "$serial_log" >&2 &
+        tail_pid=$!
+    fi
 
     # Wait for SSH to become available
-    wait_for_ssh "$ssh_port"
+    wait_for_ssh "$ssh_port" "$image_key"
+
+    # Stop tailing serial log
+    if [ -n "$tail_pid" ]; then
+        kill "$tail_pid" 2>/dev/null
+        wait "$tail_pid" 2>/dev/null
+    fi
 
     # Register this VM session so 'schupfn join' can find it
-    write_session "$name" "$VNG_PID" "$ssh_port" "$PWD" "$ssh_key"
+    # Store the image key in the session file for join to use
+    write_session "$name" "$QEMU_PID" "$ssh_port" "$PWD" "$image_key"
 
     info "VM is up, connecting"
 
-    # Copy exported files into the VM at their original absolute paths.
-    # This avoids needing sftp-server in the VM. Symlinks were already
-    # resolved to absolute paths during the export classification above.
-    # We tar from / with the full path so the directory structure is
-    # preserved in the VM (e.g. /home/user/foo/bar/file.txt).
-    # Common SSH options used for both file copy and interactive session.
+    # Common SSH options.
+    # -4: force IPv4 (qemu SLIRP hostfwd binds to 127.0.0.1)
+    # -F /dev/null: ignore user's ssh_config entirely to avoid
+    #   ControlMaster, ProxyCommand, or other settings interfering
     local -a ssh_opts=(
+        -4
+        -F /dev/null
+        -o StrictHostKeyChecking=no
+        -o UserKnownHostsFile=/dev/null
+        -o IdentitiesOnly=yes
+        -o PubkeyAcceptedAlgorithms=+ssh-rsa
         -o LogLevel=ERROR
-        -F "$HOME/.cache/virtme-ng/.ssh/virtme-ng-ssh.conf"
+        "${key_args[@]}"
+        -p "$ssh_port"
     )
-    if [ -n "$ssh_key" ]; then
-        ssh_opts+=(-i "$ssh_key")
+
+    # Quick sanity test: try a non-interactive SSH command first to
+    # verify authentication works, before copying files or opening
+    # an interactive session.
+    if ! ssh "${ssh_opts[@]}" \
+            -o BatchMode=yes \
+            -l "$username" \
+            127.0.0.1 "echo schupfn-auth-ok" 2>/dev/null | grep -q "schupfn-auth-ok"; then
+        warn "SSH authentication test failed. Trying with verbose output..."
+        ssh -v "${ssh_opts[@]}" \
+            -o BatchMode=yes \
+            -l "$username" \
+            127.0.0.1 "echo schupfn-auth-ok" 2>&1 >&2
+        die "SSH authentication failed for user '$username'"
     fi
 
-    if [ ${#dotfiles[@]} -gt 0 ]; then
-        local user
-        user=$(whoami)
-        local dest="ssh://virtme-ng:$ssh_port"
+    # Wait for 9p mounts to be ready (the mount service runs in parallel
+    # with sshd startup).  Check if $PWD exists inside the VM.
+    local mount_timeout=30
+    local mount_elapsed=0
+    while [ "$mount_elapsed" -lt "$mount_timeout" ]; do
+        if ssh "${ssh_opts[@]}" -o BatchMode=yes \
+               -l "$username" \
+               127.0.0.1 "test -d '$PWD'" 2>/dev/null; then
+            break
+        fi
+        if [ "$mount_elapsed" = "0" ]; then
+            info "waiting for 9p mounts..."
+        fi
+        sleep 1
+        mount_elapsed=$((mount_elapsed + 1))
+    done
+    if [ "$mount_elapsed" -ge "$mount_timeout" ]; then
+        warn "timed out waiting for $PWD to appear in VM (9p mounts may have failed)"
+    fi
 
-        # Strip the leading / so tar creates relative paths, then
-        # extract at / in the VM to reconstruct the absolute path.
+    # Create symlinks inside the VM for any symlinked export paths.
+    # This runs after the mount wait so the symlink targets are available.
+    if [ ${#rootfs_symlinks[@]} -gt 0 ]; then
+        local symlink_script=""
+        for entry in "${rootfs_symlinks[@]}"; do
+            local link_path="${entry%%:*}"
+            local target="${entry#*:}"
+            info "creating symlink: $link_path -> $target"
+            local escaped_dir escaped_link escaped_target
+            escaped_dir=$(printf '%q' "$(dirname "$link_path")")
+            escaped_link=$(printf '%q' "$link_path")
+            escaped_target=$(printf '%q' "$target")
+            symlink_script+="mkdir -p $escaped_dir && "
+            symlink_script+="[ -e $escaped_link ] || ln -s $escaped_target $escaped_link; "
+        done
+        ssh "${ssh_opts[@]}" -l root 127.0.0.1 "$symlink_script" 2>/dev/null \
+            || warn "failed to create symlinks in VM"
+    fi
+
+    # Copy exported files into the VM at their original absolute paths.
+    # This runs after the mount wait so $HOME ownership is fixed and
+    # the target directories are writable.
+    if [ ${#dotfiles[@]} -gt 0 ]; then
         local -a tar_paths=()
         for df in "${dotfiles[@]}"; do
             info "copying file: $df"
@@ -1494,32 +1921,12 @@ cmd_enter() {
         done
 
         tar -chf - -C / "${tar_paths[@]}" | \
-            ssh "${ssh_opts[@]}" -l "$user" "$dest" \
+            ssh "${ssh_opts[@]}" -l root 127.0.0.1 \
                 "tar -xf - -C /" 2>/dev/null \
         || warn "failed to copy exported files"
     fi
 
-    # Fix sudo inside the VM.  The rootfs is served via 9p with
-    # security_model=none, which strips the setuid bit from binaries.
-    # fix_rootfs_permissions() already made the binary readable in the
-    # exported rootfs so overlayfs can copy it up.  Here we copy it to
-    # the overlay upper layer and restore ownership + setuid.
-    # We SSH as root because sudo itself is not yet functional.
-    local copyup_output
-    copyup_output=$(ssh "${ssh_opts[@]}" -l root "ssh://virtme-ng:$ssh_port" \
-        'if [ -f /usr/bin/sudo ]; then
-            cp -a /usr/bin/sudo /usr/bin/sudo.tmp &&
-            mv /usr/bin/sudo.tmp /usr/bin/sudo &&
-            chown root:root /usr/bin/sudo &&
-            chmod 4755 /usr/bin/sudo
-        fi' 2>&1) \
-    || warn "failed to fix sudo: $copyup_output"
-
-    # SSH into the VM. We call ssh directly (rather than vng --ssh-client)
-    # because --remote-cmd doesn't allocate a PTY, resulting in no visible
-    # prompt. Use the vng SSH config for host key and identity settings,
-    # and the "ssh://virtme-ng:<port>" destination so the Host wildcard
-    # matches.
+    # SSH into the VM
     local quoted_pwd
     printf -v quoted_pwd '%q' "$PWD"
     local remote_cmd
@@ -1531,8 +1938,8 @@ cmd_enter() {
 
     ssh -t \
         "${ssh_opts[@]}" \
-        -l "$(whoami)" \
-        "ssh://virtme-ng:$ssh_port" \
+        -l "$username" \
+        127.0.0.1 \
         "$remote_cmd"
     local rc=$?
 
@@ -1588,7 +1995,6 @@ cmd_join() {
         else
             die "no running VMs found"
         fi
-        return 1
     fi
 
     local session_file
@@ -1616,20 +2022,18 @@ cmd_join() {
         read -r choice
         if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "${#sessions[@]}" ]; then
             die "invalid selection"
-            return 1
         fi
         session_file="${sessions[$((choice - 1))]}"
     fi
 
     # Read session details
-    local ssh_port workdir ssh_key
+    local ssh_port workdir ssh_key_file
     ssh_port=$(read_session "$session_file" "ssh_port")
     workdir=$(read_session "$session_file" "workdir")
-    ssh_key=$(read_session "$session_file" "ssh_key")
+    ssh_key_file=$(read_session "$session_file" "ssh_key")
 
     if ! [[ "$ssh_port" =~ ^[0-9]+$ ]]; then
         die "corrupted session file: invalid ssh_port '$ssh_port'"
-        return 1
     fi
 
     if [ -z "$name" ]; then
@@ -1641,17 +2045,23 @@ cmd_join() {
 
     info "joining VM '$name' (ssh port $ssh_port)..."
 
-    # Register this join session so 'enter --keep-alive' can detect it
+    # Register this join session so 'enter' can detect it
     acquire_join_lock "$name" "$vm_pid" "$$"
     trap 'release_join_lock "$name" "$vm_pid" "$$"' EXIT
 
-    # Build SSH options — same as cmd_enter
+    # Build SSH options
     local -a ssh_opts=(
+        -4
+        -F /dev/null
+        -o StrictHostKeyChecking=no
+        -o UserKnownHostsFile=/dev/null
+        -o IdentitiesOnly=yes
+        -o PubkeyAcceptedAlgorithms=+ssh-rsa
         -o LogLevel=ERROR
-        -F "$HOME/.cache/virtme-ng/.ssh/virtme-ng-ssh.conf"
+        -p "$ssh_port"
     )
-    if [ -n "$ssh_key" ]; then
-        ssh_opts+=(-i "$ssh_key")
+    if [ -n "$ssh_key_file" ]; then
+        ssh_opts+=(-i "$ssh_key_file")
     fi
 
     local quoted_workdir
@@ -1666,7 +2076,7 @@ cmd_join() {
     ssh -t \
         "${ssh_opts[@]}" \
         -l "$(whoami)" \
-        "ssh://virtme-ng:$ssh_port" \
+        127.0.0.1 \
         "$remote_cmd"
     local rc=$?
 
@@ -1683,14 +2093,14 @@ cmd_join() {
 
 cmd_list() {
     if [ ! -d "$CACHE_DIR" ]; then
-        echo "No cached rootfs entries."
+        echo "No cached VM images."
         return
     fi
 
     local found=0
 
     # Clean up stale session files once, then build a per-name VM count
-    # in a single pass instead of calling list_active_sessions per rootfs.
+    # in a single pass instead of calling list_active_sessions per image.
     cleanup_stale_sessions
 
     declare -A _vm_counts=()
@@ -1708,20 +2118,25 @@ cmd_list() {
     printf "%-20s %-10s %-10s %-10s %s\n" "NAME" "STATUS" "VMs" "SIZE" "EXPORTED"
     printf "%-20s %-10s %-10s %-10s %s\n" "----" "------" "---" "----" "--------"
 
-    for rootfs_dir in "$CACHE_DIR"/*/; do
-        [ -d "$rootfs_dir" ] || continue
+    for cache_entry in "$CACHE_DIR"/*/; do
+        [ -d "$cache_entry" ] || continue
 
         local name
-        name=$(basename "$rootfs_dir")
+        name=$(basename "$cache_entry")
         found=1
 
-        # Get size
+        # Get size of the qcow2 image
         local size
-        size=$(du -sh "$rootfs_dir" 2>/dev/null | cut -f1)
+        local qcow2_file="$cache_entry/$name.qcow2"
+        if [ -f "$qcow2_file" ]; then
+            size=$(du -sh "$qcow2_file" 2>/dev/null | cut -f1)
+        else
+            size="?"
+        fi
 
         # Get export date
         local exported_at
-        exported_at=$(read_meta "$rootfs_dir" "exported_at")
+        exported_at=$(read_meta "$cache_entry" "exported_at")
         if [ -z "$exported_at" ]; then
             exported_at="unknown"
         fi
@@ -1729,7 +2144,7 @@ cmd_list() {
         # Check freshness
         local status="unknown"
         if podman container inspect "$name" >/dev/null 2>&1; then
-            if check_freshness "$name" "$rootfs_dir" "0" >/dev/null 2>&1; then
+            if check_freshness "$name" "$cache_entry" "0" >/dev/null 2>&1; then
                 status="fresh"
             else
                 status="stale"
@@ -1751,7 +2166,7 @@ cmd_list() {
     done
 
     if [ "$found" = "0" ]; then
-        echo "No cached rootfs entries."
+        echo "No cached VM images."
     fi
 }
 
@@ -1762,16 +2177,13 @@ cmd_clean() {
 
     if [ -n "$name" ]; then
         validate_container_name "$name"
-        local rootfs_dir="$CACHE_DIR/$name"
-        if [ ! -d "$rootfs_dir" ]; then
-            die "no cached rootfs for '$name'"
+        local cache_entry="$CACHE_DIR/$name"
+        if [ ! -d "$cache_entry" ]; then
+            die "no cached image for '$name'"
         fi
 
-        info "removing cached rootfs for '$name'..."
-        podman unshare rm -rf "$rootfs_dir"
-        if [ $? -ne 0 ]; then
-            die "failed to remove '$rootfs_dir'"
-        fi
+        info "removing cached image for '$name'..."
+        rm -rf "$cache_entry"
         info "done"
         return
     fi
@@ -1792,22 +2204,24 @@ cmd_clean() {
 
     printf "%-20s %s\n" "NAME" "SIZE"
     printf "%-20s %s\n" "----" "----"
-    for rootfs_dir in "$CACHE_DIR"/*/; do
-        [ -d "$rootfs_dir" ] || continue
+    for cache_entry in "$CACHE_DIR"/*/; do
+        [ -d "$cache_entry" ] || continue
         local entry_name entry_size
-        entry_name=$(basename "$rootfs_dir")
-        entry_size=$(du -sh "$rootfs_dir" 2>/dev/null | cut -f1)
+        entry_name=$(basename "$cache_entry")
+        local qcow2_file="$cache_entry/$entry_name.qcow2"
+        if [ -f "$qcow2_file" ]; then
+            entry_size=$(du -sh "$qcow2_file" 2>/dev/null | cut -f1)
+        else
+            entry_size="?"
+        fi
         printf "%-20s %s\n" "$entry_name" "$entry_size"
     done
     echo ""
-    printf "Remove all %d cached rootfs entries? [y/N] " "$count"
+    printf "Remove all %d cached images? [y/N] " "$count"
     read -r answer
     case "$answer" in
         y|Y|yes|YES)
-            podman unshare rm -rf "$CACHE_DIR"
-            if [ $? -ne 0 ]; then
-                die "failed to remove '$CACHE_DIR'"
-            fi
+            rm -rf "$CACHE_DIR"
             info "cleaned $count entries"
             ;;
         *)

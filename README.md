@@ -1,7 +1,7 @@
 # schupfn
 
 Run [toolbox](https://containertoolbx.org/) containers inside ephemeral virtual
-machines using [virtme-ng](https://github.com/arighi/virtme-ng).
+machines using [qemu](https://www.qemu.org/).
 
 The idea: you set up a toolbox container the way you like it, then
 `schupfn enter` boots that container as a VM instead of entering it as a
@@ -20,12 +20,13 @@ in "unsuccessful".
 ## Requirements
 
 - [podman](https://podman.io/) and [toolbox](https://containertoolbx.org/)
-- [virtme-ng](https://github.com/arighi/virtme-ng) (`vng`)
+- [qemu](https://www.qemu.org/) (`qemu-system-x86_64`, `qemu-img`)
+- [libguestfs-tools](https://libguestfs.org/) (`virt-make-fs`, `virt-customize`)
 - [yq](https://github.com/mikefarah/yq) (only needed if you use a config file)
 
 The toolbox container itself needs a few packages installed:
-`openssh-server`, `systemd-udev`, and `busybox`. schupfn will notice if
-they're missing and offer to install them for you.
+`openssh-server`, `systemd-udev`, and `dbus-broker`. schupfn will
+notice if they're missing and offer to install them for you.
 
 You'll also need SSH public keys in `~/.ssh/id_*.pub` -- that's how
 authentication into the VM works.
@@ -50,9 +51,9 @@ toolbox run -c mybox sudo dnf install -y gcc make  # or whatever you need
 schupfn enter mybox
 ```
 
-That's it. schupfn exports the container filesystem, boots a VM with the
-host kernel via virtme-ng, waits for SSH, and drops you into a shell.
-Your `$PWD` is mounted at the same path inside the VM.
+That's it. schupfn exports the container to a qcow2 disk image, boots a
+VM with the host kernel via qemu, waits for SSH, and drops you into a
+shell. Your `$PWD` is mounted at the same path inside the VM.
 
 When you exit the shell, the VM shuts down.
 
@@ -109,8 +110,6 @@ vm:
   memory: 8G
   cpus: 4
   network: false
-
-ssh_key: ~/.ssh/id_ed25519
 ```
 
 All fields are optional. CLI arguments override config values -- if you
@@ -131,7 +130,6 @@ Parsing requires [yq](https://github.com/mikefarah/yq).
 | `vm.memory`  | string        | VM memory, e.g. `4G`, `512M` (default: `4G`)       |
 | `vm.cpus`    | int           | VM CPU count (default: host CPU count)              |
 | `vm.network` | bool          | Set to `false` to disable the extra network device  |
-| `ssh_key`    | path          | SSH private key to use for the VM connection        |
 
 ## Commands
 
@@ -145,11 +143,12 @@ Export the container and boot it as a VM.
 | `--export-rw <path>` | Like `--export-ro`, but directories are mounted read-write|
 | `--command <cmd>`    | Run a command in the VM instead of an interactive shell   |
 | `--config <path>`    | Use a specific config file instead of searching for one   |
-| `--refresh`          | Force re-export of the rootfs                             |
+| `--refresh`          | Force re-export of the disk image                         |
 | `--deep-check`       | Use `podman diff` for thorough staleness detection        |
 | `--memory <size>`    | VM memory (default: `4G`)                                 |
 | `--cpus <n>`         | VM CPU count                                              |
 | `--no-network`       | Disable the extra network device (SSH still works)        |
+| `--console`          | Boot with serial console instead of SSH (for debugging)   |
 | `--verbose`          | Show VM boot output                                       |
 
 ### `schupfn join [<name>] [options]`
@@ -180,39 +179,39 @@ schupfn join mybox --command "make test"
 
 ### `schupfn list`
 
-Show cached rootfs entries with their freshness status and size.
+Show cached VM images with their freshness status and size.
 
 ### `schupfn clean [<name>]`
 
-Remove cached rootfs entries. Without a name, removes all of them (with
+Remove cached VM images. Without a name, removes all of them (with
 confirmation).
 
 ## How it works
 
-1. The container's filesystem is exported via `podman export` into
-   `$XDG_CACHE_HOME/schupfn/roots/<name>/`. This is cached and only
-   re-exported when the container changes (image ID, container ID, or
-   `podman inspect` output differ).
+1. The container's filesystem is exported via `podman export` to a
+   tarball, then converted to a qcow2 disk image using `virt-make-fs`.
+   The image is cached under `$XDG_CACHE_HOME/schupfn/images/<name>/`
+   and only re-exported when the container changes.
 
-2. The rootfs is patched: your user is added to `/etc/passwd` if needed,
-   virtio kernel modules are copied in for networking, and sshd's
-   privilege separation directory gets a workaround for 9p ownership
-   issues.
+2. The image is customized via `virt-customize`: your user is added,
+   SSH host keys are generated, sshd is enabled, a systemd service
+   for mounting 9p shares is installed, and networking is configured.
 
-3. virtme-ng boots a VM using the host kernel with the exported rootfs.
-   `$PWD` and any exported directories are mounted via 9p at their
-   original paths.
+3. qemu boots a VM using the host kernel and initramfs with the qcow2
+   image as the root filesystem. Each session gets a copy-on-write
+   snapshot so the base image stays clean.
 
-4. schupfn waits for sshd inside the VM to come up, copies any exported
-   files into the VM at their original paths, then opens an interactive
-   SSH session.
+4. `$PWD` and any exported directories are mounted via 9p at their
+   original paths. schupfn waits for sshd to come up, copies any
+   exported files, then opens an interactive SSH session.
 
-5. When you exit, the VM is killed and cleaned up.
+5. When you exit, the VM is killed and cleaned up. The snapshot is
+   deleted but the base image is preserved for next time.
 
 ## Cache
 
-Exported rootfs trees live under `~/.cache/schupfn/roots/` (or
-`$XDG_CACHE_HOME/schupfn/roots/`). They're reused across runs until the
+Cached VM images live under `~/.cache/schupfn/images/` (or
+`$XDG_CACHE_HOME/schupfn/images/`). They're reused across runs until the
 container changes. Use `schupfn clean` to reclaim disk space.
 
 ## License

@@ -29,6 +29,7 @@ Or run a single test file:
 | `find_config.bats`      | Walking `$PWD` upward to find `.schupfn/config.yml`     |
 | `load_config.bats`      | Parsing config YAML with yq, all fields and edge cases  |
 | `classify_export.bats`  | Sorting export paths into dirs/files, symlink handling   |
+| `session.bats`          | VM session tracking, join locks, stale session cleanup   |
 
 Tests that need `yq` are skipped automatically if it's not installed.
 
