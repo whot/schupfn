@@ -125,33 +125,6 @@ teardown() {
     [ "${#dotfiles[@]}" -eq 2 ]
 }
 
-# ── add_overlay ──────────────────────────────────────────────────────────
-
-@test "add_overlay: extracts top-level directory" {
-    local -a overlay_dirs=()
-    add_overlay "/home/user/project"
-    [ "${#overlay_dirs[@]}" -eq 1 ]
-    [ "${overlay_dirs[0]}" = "/home" ]
-}
-
-@test "add_overlay: deduplicates entries" {
-    local -a overlay_dirs=()
-    add_overlay "/home/user/project1"
-    add_overlay "/home/user/project2"
-    add_overlay "/tmp/stuff"
-    [ "${#overlay_dirs[@]}" -eq 2 ]
-    [ "${overlay_dirs[0]}" = "/home" ]
-    [ "${overlay_dirs[1]}" = "/tmp" ]
-}
-
-@test "add_overlay: different top-level dirs all added" {
-    local -a overlay_dirs=()
-    add_overlay "/home/user"
-    add_overlay "/var/lib"
-    add_overlay "/opt/tool"
-    [ "${#overlay_dirs[@]}" -eq 3 ]
-}
-
 # ── check_nested_export_conflicts ────────────────────────────────────────
 
 @test "check_nested_export_conflicts: rw child inside ro parent errors" {

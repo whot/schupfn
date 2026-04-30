@@ -15,7 +15,7 @@ setup() {
     _cfg_memory=""
     _cfg_cpus=""
     _cfg_network=""
-    _cfg_ssh_key=""
+
 }
 
 teardown() {
@@ -111,29 +111,6 @@ EOF
     [ -z "$_cfg_network" ]
 }
 
-@test "load_config: parses ssh_key with tilde expansion" {
-    yq_or_skip
-    # Create a fake key file at ~/fake_key inside our tmpdir HOME
-    local saved_home="$HOME"
-    export HOME="$TMPDIR"
-    mkdir -p "$TMPDIR/.ssh"
-    touch "$TMPDIR/.ssh/test_key"
-    cat > "$TMPDIR/config.yml" <<'EOF'
-ssh_key: ~/.ssh/test_key
-EOF
-    load_config "$TMPDIR/config.yml"
-    [ "$_cfg_ssh_key" = "$TMPDIR/.ssh/test_key" ]
-    export HOME="$saved_home"
-}
-
-@test "load_config: dies on nonexistent ssh_key" {
-    yq_or_skip
-    cat > "$TMPDIR/config.yml" <<'EOF'
-ssh_key: /nonexistent/path/key
-EOF
-    load_config "$TMPDIR/config.yml" || true
-    assert_die_called "ssh_key not found"
-}
 
 @test "load_config: dies on invalid YAML" {
     yq_or_skip
@@ -155,7 +132,6 @@ EOF
     [ -z "$_cfg_memory" ]
     [ -z "$_cfg_cpus" ]
     [ -z "$_cfg_network" ]
-    [ -z "$_cfg_ssh_key" ]
 }
 
 @test "load_config: missing keys produce empty defaults" {
@@ -172,10 +148,6 @@ EOF
 
 @test "load_config: full config with all fields" {
     yq_or_skip
-    local saved_home="$HOME"
-    export HOME="$TMPDIR"
-    mkdir -p "$TMPDIR/.ssh"
-    touch "$TMPDIR/.ssh/id_ed25519"
     cat > "$TMPDIR/config.yml" <<'EOF'
 container: full-test
 command: ./run.sh
@@ -187,7 +159,7 @@ vm:
   memory: 16G
   cpus: 8
   network: false
-ssh_key: ~/.ssh/id_ed25519
+
 EOF
     load_config "$TMPDIR/config.yml"
     [ "$_cfg_container" = "full-test" ]
@@ -199,18 +171,7 @@ EOF
     [ "$_cfg_memory" = "16G" ]
     [ "$_cfg_cpus" = "8" ]
     [ "$_cfg_network" = "0" ]
-    [ "$_cfg_ssh_key" = "$TMPDIR/.ssh/id_ed25519" ]
-    export HOME="$saved_home"
-}
 
-@test "load_config: ssh_key with absolute path (no tilde)" {
-    yq_or_skip
-    touch "$TMPDIR/mykey"
-    cat > "$TMPDIR/config.yml" <<EOF
-ssh_key: $TMPDIR/mykey
-EOF
-    load_config "$TMPDIR/config.yml"
-    [ "$_cfg_ssh_key" = "$TMPDIR/mykey" ]
 }
 
 @test "load_config: warns on unknown top-level key" {

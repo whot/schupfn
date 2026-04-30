@@ -1,4 +1,4 @@
-.TH SCHUPFN 1 "2026-04-22" "schupfn 0.1.0"
+.TH SCHUPFN 1 "2026-04-30" "schupfn 0.2.0"
 .SH NAME
 schupfn \- run toolbox containers in virtual machines
 .SH SYNOPSIS
@@ -17,7 +17,9 @@ schupfn \- run toolbox containers in virtual machines
 .SH DESCRIPTION
 .B schupfn
 boots a toolbox container as a virtual machine using
-.BR virtme\-ng (1).
+.BR qemu (1).
+The container is converted to a qcow2 disk image and booted with the
+host kernel.
 The current working directory is mounted read\-write inside the VM at
 the same path; everything else on the host is inaccessible.
 .PP
@@ -33,8 +35,8 @@ Create and configure a toolbox container the usual way
 .IP 2.
 Run
 .B schupfn enter
-to export the container's filesystem, boot it as a VM with the host
-kernel, and SSH in.
+to export the container's filesystem to a qcow2 disk image, boot it
+as a VM with the host kernel, and SSH in.
 .IP 3.
 Work inside the VM as you would inside
 .BR toolbox (1).
@@ -43,7 +45,7 @@ When you exit, the VM shuts down.
 .SS enter \fR[\fIname\fR] [\fIoptions\fR]
 Export the toolbox container
 .I name
-to a local rootfs and boot it as a VM.
+to a qcow2 disk image and boot it as a VM.
 If
 .I name
 is omitted, the
@@ -54,7 +56,7 @@ field from the configuration file is used (see
 The container must have these packages installed:
 .BR openssh\-server ,
 .BR systemd\-udev ,
-.BR busybox .
+.BR dbus\-broker .
 If any are missing,
 .B schupfn
 will offer to install them.
@@ -66,7 +68,7 @@ Make an additional host path available in the VM.
 If
 .I path
 is a directory (or a symlink to one), it is mounted read\-only at
-its original absolute path.
+its original absolute path via 9p.
 If
 .I path
 is a file (or a symlink to one), it is copied into the VM at its
@@ -97,7 +99,7 @@ in parent directories.
 It is an error if the file does not exist.
 .TP
 .B \-\-refresh
-Force re\-export of the rootfs, even if the cached copy appears fresh.
+Force re\-export of the disk image, even if the cached copy appears fresh.
 .TP
 .B \-\-deep\-check
 Use
@@ -119,6 +121,11 @@ Defaults to the host CPU count.
 .B \-\-no\-network
 Disable the extra user\-mode network device.
 The internal SSH network device is unaffected.
+.TP
+.B \-\-console
+Boot with the serial console on stdio instead of connecting via SSH.
+Useful for debugging boot issues.
+Use Ctrl\-A X to quit the VM.
 .TP
 .B \-\-verbose
 Show VM boot output on stderr.
@@ -155,20 +162,20 @@ The exit code of
 is propagated as the exit code of
 .BR schupfn .
 .SS list
-Show cached rootfs entries with their freshness status, number of
+Show cached VM images with their freshness status, number of
 running VMs, size, and export date.
 Freshness is one of:
 .TP
 .B fresh
-The cached rootfs matches the current container state.
+The cached image matches the current container state.
 .TP
 .B stale
-The container has changed since the rootfs was exported.
+The container has changed since the image was exported.
 .TP
 .B orphaned
 The container no longer exists.
 .SS clean \fR[\fIname\fR]
-Remove cached rootfs entries.
+Remove cached VM images.
 If
 .I name
 is given, only that entry is removed.
@@ -250,11 +257,6 @@ Set to
 to disable the extra network device.
 Same as
 .BR \-\-no\-network .
-.TP
-.B ssh_key
-.RI ( path )
-SSH private key to use when connecting to the VM.
-The path is validated at startup; a missing file is a fatal error.
 .SS Example
 .PP
 .in +4n
@@ -273,8 +275,6 @@ vm:
   memory: 8G
   cpus: 4
   network: false
-
-ssh_key: ~/.ssh/id_ed25519
 .EE
 .in
 .SH ENVIRONMENT
@@ -293,11 +293,11 @@ then
 .IR $XDG_CONFIG_HOME/schupfn/default\-config.yml .
 .TP
 .B XDG_CACHE_HOME
-Base directory for cached rootfs trees.
+Base directory for cached VM images.
 Defaults to
 .IR ~/.cache .
 The cache lives under
-.IR $XDG_CACHE_HOME/schupfn/roots/ .
+.IR $XDG_CACHE_HOME/schupfn/images/ .
 .TP
 .B XDG_RUNTIME_DIR
 Base directory for runtime session files.
@@ -326,8 +326,8 @@ or container\-specific config is found.
 Defaults to
 .IR ~/.config/schupfn/default\-config.yml .
 .TP
-.I ~/.cache/schupfn/roots/<name>/
-Cached rootfs for a container.
+.I ~/.cache/schupfn/images/<name>/
+Cached qcow2 disk image and metadata for a container.
 Managed by
 .B schupfn list
 and
@@ -410,32 +410,12 @@ Use a config file so you only need to type:
 schupfn enter
 .EE
 .in
-.SH CAVEATS
-.TP
-.B Running from $HOME
-.B schupfn
-refuses to start when the current working directory is
-.BR $HOME .
-The VM mounts
-.B $PWD
-via 9p (plan\~9 filesystem protocol), which does not support POSIX
-file locking or
-.BR mmap .
-Mounting
-.B $HOME
-via 9p would shadow the tmpfs\-backed overlay on
-.BR /home ,
-causing applications that depend on these features (e.g.\& SQLite
-WAL mode) to fail.
-Run
-.B schupfn
-from a subdirectory of
-.B $HOME
-instead.
 .SH SEE ALSO
 .BR toolbox (1),
 .BR podman (1),
-.BR vng (1),
+.BR qemu\-system\-x86_64 (1),
+.BR virt\-make\-fs (1),
+.BR virt\-customize (1),
 .BR ssh (1),
 .BR yq (1)
 .SH LICENSE
