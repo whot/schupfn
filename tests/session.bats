@@ -233,3 +233,134 @@ EOF
     [[ "$output" == *"livebox"* ]]
     [[ "$output" != *"deadbox"* ]]
 }
+
+# ── acquire_join_lock / release_join_lock ───────────────────────────────────
+
+@test "acquire_join_lock: creates lock file" {
+    acquire_join_lock "mybox" "1000" "2000"
+
+    [ -f "$SESSION_DIR/mybox-1000.join.2000" ]
+}
+
+@test "acquire_join_lock: creates SESSION_DIR if it does not exist" {
+    [ ! -d "$SESSION_DIR" ]
+
+    acquire_join_lock "mybox" "1000" "2000"
+
+    [ -d "$SESSION_DIR" ]
+}
+
+@test "acquire_join_lock: multiple joins create separate files" {
+    acquire_join_lock "mybox" "1000" "2000"
+    acquire_join_lock "mybox" "1000" "3000"
+
+    [ -f "$SESSION_DIR/mybox-1000.join.2000" ]
+    [ -f "$SESSION_DIR/mybox-1000.join.3000" ]
+}
+
+@test "acquire_join_lock: no-op when SESSION_DIR is empty" {
+    SESSION_DIR=""
+    run acquire_join_lock "mybox" "1000" "2000"
+    [ "$status" -eq 0 ]
+}
+
+@test "release_join_lock: removes lock file" {
+    acquire_join_lock "mybox" "1000" "2000"
+    [ -f "$SESSION_DIR/mybox-1000.join.2000" ]
+
+    release_join_lock "mybox" "1000" "2000"
+    [ ! -f "$SESSION_DIR/mybox-1000.join.2000" ]
+}
+
+@test "release_join_lock: does not fail if file does not exist" {
+    run release_join_lock "mybox" "1000" "9999"
+    [ "$status" -eq 0 ]
+}
+
+@test "release_join_lock: does not remove other locks" {
+    acquire_join_lock "mybox" "1000" "2000"
+    acquire_join_lock "mybox" "1000" "3000"
+
+    release_join_lock "mybox" "1000" "2000"
+
+    [ ! -f "$SESSION_DIR/mybox-1000.join.2000" ]
+    [ -f "$SESSION_DIR/mybox-1000.join.3000" ]
+}
+
+@test "release_join_lock: no-op when SESSION_DIR is empty" {
+    SESSION_DIR=""
+    run release_join_lock "mybox" "1000" "2000"
+    [ "$status" -eq 0 ]
+}
+
+# ── count_active_joins ─────────────────────────────────────────────────────
+
+@test "count_active_joins: returns 0 when no joins exist" {
+    run count_active_joins "mybox" "1000"
+    [ "$status" -eq 0 ]
+    [ "$output" = "0" ]
+}
+
+@test "count_active_joins: returns 0 when SESSION_DIR does not exist" {
+    rm -rf "$SESSION_DIR"
+    run count_active_joins "mybox" "1000"
+    [ "$status" -eq 0 ]
+    [ "$output" = "0" ]
+}
+
+@test "count_active_joins: counts live join sessions" {
+    # Use our own PID — guaranteed to be alive
+    local my_pid=$$
+    acquire_join_lock "mybox" "1000" "$my_pid"
+
+    run count_active_joins "mybox" "1000"
+    [ "$status" -eq 0 ]
+    [ "$output" = "1" ]
+}
+
+@test "count_active_joins: removes stale join locks" {
+    # Use a dead PID
+    acquire_join_lock "mybox" "1000" "9999999"
+    [ -f "$SESSION_DIR/mybox-1000.join.9999999" ]
+
+    run count_active_joins "mybox" "1000"
+    [ "$status" -eq 0 ]
+    [ "$output" = "0" ]
+
+    # Lock file should have been cleaned up
+    [ ! -f "$SESSION_DIR/mybox-1000.join.9999999" ]
+}
+
+@test "count_active_joins: counts only live joins, removes stale" {
+    local my_pid=$$
+    acquire_join_lock "mybox" "1000" "$my_pid"
+    acquire_join_lock "mybox" "1000" "9999999"
+
+    run count_active_joins "mybox" "1000"
+    [ "$status" -eq 0 ]
+    [ "$output" = "1" ]
+
+    # Stale lock removed, live lock remains
+    [ ! -f "$SESSION_DIR/mybox-1000.join.9999999" ]
+    [ -f "$SESSION_DIR/mybox-1000.join.${my_pid}" ]
+}
+
+@test "count_active_joins: does not count joins for other VMs" {
+    local my_pid=$$
+    acquire_join_lock "mybox" "1000" "$my_pid"
+    acquire_join_lock "mybox" "2000" "$my_pid"
+
+    run count_active_joins "mybox" "1000"
+    [ "$status" -eq 0 ]
+    [ "$output" = "1" ]
+}
+
+@test "count_active_joins: removes lock with non-numeric join PID" {
+    mkdir -p "$SESSION_DIR"
+    touch "$SESSION_DIR/mybox-1000.join.notapid"
+
+    run count_active_joins "mybox" "1000"
+    [ "$status" -eq 0 ]
+    [ "$output" = "0" ]
+    [ ! -f "$SESSION_DIR/mybox-1000.join.notapid" ]
+}

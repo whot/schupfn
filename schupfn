@@ -283,8 +283,28 @@ _pstree_pids() {
 # vng spawns a shell which spawns qemu, so we must kill the entire
 # process tree — not just the top-level PID — to avoid orphaned
 # qemu instances.
+#
+# If any 'join' sessions are still connected, the function waits for
+# them to disconnect before shutting down.
 cleanup_vm() {
     if [ -n "${VNG_PID:-}" ] && kill -0 "$VNG_PID" 2>/dev/null; then
+
+        # Wait for active join sessions to finish
+        if [ -n "${SESSION_NAME:-}" ]; then
+            local joins
+            joins=$(count_active_joins "$SESSION_NAME" "$VNG_PID")
+            if [ "$joins" -gt 0 ]; then
+                warn "VM kept alive — $joins active join session(s) still connected"
+                info "waiting for join session(s) to disconnect before shutting down..."
+                while true; do
+                    joins=$(count_active_joins "$SESSION_NAME" "$VNG_PID")
+                    [ "$joins" -gt 0 ] || break
+                    sleep 1
+                done
+                info "all join sessions disconnected"
+            fi
+        fi
+
         info "shutting down VM (pid $VNG_PID)..."
         # Collect the full process tree (children before parents)
         local -a pids
@@ -408,6 +428,66 @@ list_active_sessions() {
         fi
         echo "$session_file"
     done
+}
+
+# ── Join tracking ───────────────────────────────────────────────────────────
+#
+# When a 'join' session connects to a VM, it creates a lock file so
+# 'enter' can detect active joins and delay shutdown (--keep-alive).
+# Lock files live alongside session files and are named:
+#   <name>-<vmpid>.join.<joinpid>
+#
+# Stale lock files (whose join PIDs are no longer running) are cleaned up
+# automatically by count_active_joins().
+
+# Create a join lock file for the given VM session.
+acquire_join_lock() {
+    [ -n "$SESSION_DIR" ] || return 0
+    local name="$1"
+    local vm_pid="$2"
+    local join_pid="$3"
+
+    mkdir -p -m 0700 "$SESSION_DIR"
+    touch "$SESSION_DIR/${name}-${vm_pid}.join.${join_pid}"
+}
+
+# Remove the join lock file for the given VM session.
+release_join_lock() {
+    [ -n "$SESSION_DIR" ] || return 0
+    local name="$1"
+    local vm_pid="$2"
+    local join_pid="$3"
+
+    rm -f "$SESSION_DIR/${name}-${vm_pid}.join.${join_pid}"
+}
+
+# Count active join sessions for a VM. Removes stale lock files (whose
+# join PID is no longer running) before counting.
+# Prints the count to stdout.
+count_active_joins() {
+    local name="$1"
+    local vm_pid="$2"
+    local count=0
+
+    [ -d "$SESSION_DIR" ] || { echo 0; return 0; }
+
+    for lock_file in "$SESSION_DIR/${name}-${vm_pid}".join.*; do
+        [ -f "$lock_file" ] || continue
+        # Extract the join PID from the filename
+        local join_pid="${lock_file##*.join.}"
+        if [ -z "$join_pid" ] || ! [[ "$join_pid" =~ ^[0-9]+$ ]]; then
+            rm -f "$lock_file"
+            continue
+        fi
+        if ! kill -0 "$join_pid" 2>/dev/null; then
+            # Join process is dead — stale lock
+            rm -f "$lock_file"
+            continue
+        fi
+        count=$((count + 1))
+    done
+
+    echo "$count"
 }
 
 # ── Configuration file ───────────────────────────────────────────────────────
@@ -658,6 +738,10 @@ Open a new SSH session to an already-running VM.
 
 If <name> is omitted and exactly one VM is running, that VM is joined
 automatically. If multiple VMs are running, an interactive menu is shown.
+
+Active join sessions are tracked automatically. When the 'enter' session
+exits, the VM waits for all join sessions to disconnect before shutting
+down.
 
 Options:
   --command <cmd>   Run <cmd> in the VM instead of an interactive shell
@@ -1495,7 +1579,14 @@ cmd_join() {
         name=$(read_session "$session_file" "name")
     fi
 
+    local vm_pid
+    vm_pid=$(read_session "$session_file" "pid")
+
     info "joining VM '$name' (ssh port $ssh_port)..."
+
+    # Register this join session so 'enter --keep-alive' can detect it
+    acquire_join_lock "$name" "$vm_pid" "$$"
+    trap 'release_join_lock "$name" "$vm_pid" "$$"' EXIT
 
     # Build SSH options — same as cmd_enter
     local -a ssh_opts=(
@@ -1521,6 +1612,8 @@ cmd_join() {
         "ssh://virtme-ng:$ssh_port" \
         "$remote_cmd"
     local rc=$?
+
+    release_join_lock "$name" "$vm_pid" "$$"
 
     if [ -n "$command" ]; then
         exit "$rc"

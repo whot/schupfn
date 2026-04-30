@@ -138,6 +138,12 @@ Session state is tracked in
 and cleaned up automatically when the VM exits or when stale
 sessions are detected.
 .PP
+Each active join session is tracked automatically.
+When the
+.B enter
+session exits, the VM waits for all join sessions to disconnect
+before shutting down.
+.PP
 The options are as follows:
 .TP
 .BI \-\-command " cmd"
