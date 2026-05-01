@@ -10,6 +10,7 @@ setup() {
     # matching what cmd_enter does before the classify loop.
     rw_mount_dirs=()
     ro_mount_dirs=()
+    cow_mount_dirs=()
     rootfs_symlinks=()
     dotfiles=()
 }
@@ -40,6 +41,17 @@ teardown() {
     [ "${#ro_mount_dirs[@]}" -eq 0 ]
 }
 
+@test "classify_export: directory with mode cow goes to cow_mount_dirs" {
+    mkdir -p "$TMPDIR/mydir"
+
+    classify_export "$TMPDIR/mydir" "cow"
+    assert_die_not_called
+    [ "${#cow_mount_dirs[@]}" -eq 1 ]
+    [ "${cow_mount_dirs[0]}" = "$(realpath "$TMPDIR/mydir")" ]
+    [ "${#rw_mount_dirs[@]}" -eq 0 ]
+    [ "${#ro_mount_dirs[@]}" -eq 0 ]
+}
+
 # ── Files ────────────────────────────────────────────────────────────────
 
 @test "classify_export: regular file goes to dotfiles (mode ro)" {
@@ -60,6 +72,13 @@ teardown() {
     assert_die_not_called
     [ "${#dotfiles[@]}" -eq 1 ]
     [ "${dotfiles[0]}" = "$(realpath "$TMPDIR/myfile")" ]
+}
+
+@test "classify_export: cow mode rejects files" {
+    touch "$TMPDIR/myfile"
+
+    classify_export "$TMPDIR/myfile" "cow" || true
+    assert_die_called
 }
 
 # ── Symlinks ─────────────────────────────────────────────────────────────
@@ -205,4 +224,38 @@ teardown() {
     check_nested_export_conflicts || true
     assert_die_called "conflicting exports"
     assert_die_called "nested inside"
+}
+
+@test "check_nested_export_conflicts: cow child inside ro parent errors" {
+    mkdir -p "$TMPDIR/foo/bar"
+
+    classify_export "$TMPDIR/foo" "ro"
+    classify_export "$TMPDIR/foo/bar" "cow"
+    assert_die_not_called
+
+    check_nested_export_conflicts || true
+    assert_die_called "conflicting exports"
+    assert_die_called "nested inside"
+}
+
+@test "check_nested_export_conflicts: same path as ro and cow errors" {
+    mkdir -p "$TMPDIR/foo"
+
+    classify_export "$TMPDIR/foo" "ro"
+    classify_export "$TMPDIR/foo" "cow"
+    assert_die_not_called
+
+    check_nested_export_conflicts || true
+    assert_die_called "conflicting exports"
+}
+
+@test "check_nested_export_conflicts: non-overlapping cow and rw are fine" {
+    mkdir -p "$TMPDIR/aaa" "$TMPDIR/bbb"
+
+    classify_export "$TMPDIR/aaa" "cow"
+    classify_export "$TMPDIR/bbb" "rw"
+    assert_die_not_called
+
+    check_nested_export_conflicts || true
+    assert_die_not_called
 }

@@ -81,6 +81,16 @@ Like
 but directories are mounted read\-write.
 This option may be given multiple times.
 .TP
+.BI \-\-export\-cow " path"
+Like
+.B \-\-export\-ro
+but the directory is writable inside the VM via overlayfs.
+Reads come from the host directory; writes go to a tmpfs upper layer
+and are lost when the VM shuts down.
+The host directory is never modified.
+Only directories are supported (not individual files).
+This option may be given multiple times.
+.TP
 .BI \-\-command " cmd"
 Run
 .I cmd
@@ -248,6 +258,12 @@ Same as
 Paths to export read\-write into the VM.
 Same as
 .BR \-\-export\-rw .
+.TP
+.B export\-cow
+.RI ( "list of paths" )
+Paths to export with copy\-on\-write overlay.
+Same as
+.BR \-\-export\-cow .
 .TP
 .B vm.memory
 .RI ( string )
