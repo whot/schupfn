@@ -1325,9 +1325,9 @@ NETSVC
 
     # ── Hostname ────────────────────────────────────────────────────────
 
-    # Remove any dangling symlink (toolbox may link to /run/host/...)
-    _brun bash -c 'rm -f /etc/hostname'
-    echo "$name" | _bwrite /etc/hostname 0644
+    # Set hostname — use buildah config instead of writing the file
+    # directly (avoids "Device or resource busy" on /etc/hostname)
+    buildah config --hostname "$name" "$wc" >/dev/null 2>&1 || true
 
     # ── Export ──────────────────────────────────────────────────────────
 
@@ -1850,22 +1850,6 @@ cmd_enter() {
         die "SSH authentication failed for user '$username'"
     fi
 
-    # Copy exported files into the VM at their original absolute paths.
-    if [ ${#dotfiles[@]} -gt 0 ]; then
-        # Strip the leading / so tar creates relative paths, then
-        # extract at / in the VM to reconstruct the absolute path.
-        local -a tar_paths=()
-        for df in "${dotfiles[@]}"; do
-            info "copying file: $df"
-            tar_paths+=("${df#/}")
-        done
-
-        tar -chf - -C / "${tar_paths[@]}" | \
-            ssh "${ssh_opts[@]}" -l "$username" 127.0.0.1 \
-                "tar -xf - -C /" 2>/dev/null \
-        || warn "failed to copy exported files"
-    fi
-
     # Wait for 9p mounts to be ready (the mount service runs in parallel
     # with sshd startup).  Check if $PWD exists inside the VM.
     local mount_timeout=30
@@ -1899,6 +1883,22 @@ cmd_enter() {
         done
         ssh "${ssh_opts[@]}" -l root 127.0.0.1 "$symlink_script" 2>/dev/null \
             || warn "failed to create symlinks in VM"
+    fi
+
+    # Copy exported files into the VM at their original absolute paths.
+    # This runs after the mount wait so $HOME ownership is fixed and
+    # the target directories are writable.
+    if [ ${#dotfiles[@]} -gt 0 ]; then
+        local -a tar_paths=()
+        for df in "${dotfiles[@]}"; do
+            info "copying file: $df"
+            tar_paths+=("${df#/}")
+        done
+
+        tar -chf - -C / "${tar_paths[@]}" | \
+            ssh "${ssh_opts[@]}" -l root 127.0.0.1 \
+                "tar -xf - -C /" 2>/dev/null \
+        || warn "failed to copy exported files"
     fi
 
     # SSH into the VM
