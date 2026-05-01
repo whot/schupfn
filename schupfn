@@ -626,14 +626,17 @@ find_config_file() {
 
 # Parse a config file with yq and set the corresponding variables.
 # Sets the following variables in the caller's scope via nameref:
-#   _cfg_container - default container name, empty if not set
-#   _cfg_command   - command to run instead of a shell, empty if not set
-#   _cfg_exports   - array of read-only export paths from config
+#   _cfg_container  - default container name, empty if not set
+#   _cfg_command    - command to run instead of a shell, empty if not set
+#   _cfg_exports    - array of read-only export paths from config
 #   _cfg_exports_rw - array of read-write export paths from config
-#   _cfg_memory    - VM memory (e.g. "2G"), empty if not set
-#   _cfg_cpus      - VM CPU count, empty if not set
-#   _cfg_network   - "0" if network: false, empty if not set
-#   _cfg_exports_cow - array of cow export paths from config
+#   _cfg_exports_cow - array of copy-on-write export paths from config
+#   _cfg_memory     - VM memory (e.g. "2G"), empty if not set
+#   _cfg_cpus       - VM CPU count, empty if not set
+#   _cfg_network    - "0" if network: false, empty if not set
+#   _cfg_display    - VM display adapter type, empty if not set
+#   _cfg_image_size - disk image size, empty if not set
+#   _cfg_follow_git_worktrees - "1" if follow-git-worktrees: true, empty if not set
 load_config() {
     local config_file="$1"
 
@@ -664,6 +667,7 @@ load_config() {
         "cpus="      + ((.vm.cpus // "") | tostring),
         "network="   + (.vm.network | tostring),
         "display="   + (.vm.display // ""),
+        "image_size=" + (.["image-size"] // ""),
         "follow_git_worktrees=" + (.["follow-git-worktrees"] | tostring),
         "__EXPORT_RO__",
         (.["export-ro"] // [] | .[]),
@@ -695,6 +699,7 @@ load_config() {
                     cpus)      raw_cpus="$val" ;;
                     network)   raw_network="$val" ;;
                     display)   _cfg_display="$val" ;;
+                    image_size) _cfg_image_size="$val" ;;
                     follow_git_worktrees) raw_follow_git_worktrees="$val" ;;
                 esac
                 ;;
@@ -718,7 +723,7 @@ load_config() {
                 ;;
             __KEYS__)
                 [ -z "$line" ] && continue
-                local _known_keys=" container command export-ro export-rw export-cow follow-git-worktrees vm vm.memory vm.cpus vm.network vm.display "
+                local _known_keys=" container command export-ro export-rw export-cow follow-git-worktrees image-size vm vm.memory vm.cpus vm.network vm.display "
                 if [[ "$_known_keys" != *" $line "* ]]; then
                     warn "unknown config key '$line' in $config_file"
                 fi
@@ -783,6 +788,9 @@ Options:
   --cpus <n>        VM CPU count (default: host CPU count)
   --command <cmd>   Run <cmd> in the VM instead of an interactive shell
   --config <path>   Use <path> as config file instead of searching for one
+  --image-size <size>
+                    Size of the qcow2 disk image, e.g. 4G, 10G.
+                    Default: auto-sized from container (tarball + 50% headroom)
   --follow-git-worktrees
                     If \$PWD is a git worktree, automatically export the main
                     git directory read-write so git operations work in the VM
@@ -810,6 +818,7 @@ Configuration file:
     export-cow:
       - ~/src/reference-tree
     follow-git-worktrees: true
+    image-size: 10G
     vm:
       memory: 8G
       cpus: 4
@@ -1175,6 +1184,7 @@ UNIT
 export_image() {
     local name="$1"
     local cache_dir="$2"
+    local user_image_size="${3:-}"
 
     info "exporting container '$name' to disk image..."
 
@@ -1464,18 +1474,26 @@ NETSVC
 
     # ── Phase 2: create qcow2 image ────────────────────────────────────
 
-    # Compute image size: tarball size + 50% headroom, minimum 2G
-    local tar_size_bytes
-    tar_size_bytes=$(stat --format='%s' "$tarball" 2>/dev/null) \
-        || tar_size_bytes=$(stat -f '%z' "$tarball" 2>/dev/null) \
-        || tar_size_bytes=0
-    local image_size_bytes=$(( tar_size_bytes * 3 / 2 ))
-    local min_size=$(( 2 * 1024 * 1024 * 1024 ))  # 2G
-    if [ "$image_size_bytes" -lt "$min_size" ]; then
-        image_size_bytes=$min_size
+    local image_size
+    if [ -n "$user_image_size" ]; then
+        if ! [[ "$user_image_size" =~ ^[0-9]+[KMGT]$ ]]; then
+            die "invalid --image-size format: '$user_image_size' (expected e.g. 4G, 512M, 10G)"
+        fi
+        image_size="$user_image_size"
+    else
+        # Auto-size: tarball size + 50% headroom, minimum 2G
+        local tar_size_bytes
+        tar_size_bytes=$(stat --format='%s' "$tarball" 2>/dev/null) \
+            || tar_size_bytes=$(stat -f '%z' "$tarball" 2>/dev/null) \
+            || tar_size_bytes=0
+        local image_size_bytes=$(( tar_size_bytes * 3 / 2 ))
+        local min_size=$(( 2 * 1024 * 1024 * 1024 ))  # 2G
+        if [ "$image_size_bytes" -lt "$min_size" ]; then
+            image_size_bytes=$min_size
+        fi
+        local image_size_gb=$(( (image_size_bytes + 1073741823) / 1073741824 ))
+        image_size="${image_size_gb}G"
     fi
-    local image_size_gb=$(( (image_size_bytes + 1073741823) / 1073741824 ))
-    local image_size="${image_size_gb}G"
 
     info "creating ${image_size} qcow2 image..."
     if ! virt-make-fs --format=qcow2 --type=ext4 --size="$image_size" \
@@ -1547,7 +1565,7 @@ cmd_enter() {
     local -a exports=()
     local -a exports_rw=()
     local -a exports_cow=()
-    local cli_memory="" cli_cpus="" cli_network="" cli_display=""
+    local cli_memory="" cli_cpus="" cli_network="" cli_display="" cli_image_size=""
     local follow_git_worktrees=0
 
     while [ $# -gt 0 ]; do
@@ -1615,6 +1633,14 @@ cmd_enter() {
                 verbose=1
                 shift
                 ;;
+            --image-size)
+                [ $# -ge 2 ] || die "--image-size requires an argument (e.g. 4G, 10G)"
+                if ! [[ "$2" =~ ^[0-9]+[KMGT]?$ ]]; then
+                    die "invalid --image-size format '$2': expected a number followed by K, M, G, or T (e.g. 4G, 10G, 512M)"
+                fi
+                cli_image_size="$2"
+                shift 2
+                ;;
             --follow-git-worktrees)
                 follow_git_worktrees=1
                 shift
@@ -1645,7 +1671,7 @@ cmd_enter() {
     local -a _cfg_exports=()
     local -a _cfg_exports_rw=()
     local -a _cfg_exports_cow=()
-    local _cfg_container="" _cfg_command="" _cfg_memory="" _cfg_cpus="" _cfg_network="" _cfg_display="" _cfg_follow_git_worktrees=""
+    local _cfg_container="" _cfg_command="" _cfg_memory="" _cfg_cpus="" _cfg_network="" _cfg_display="" _cfg_image_size="" _cfg_follow_git_worktrees=""
     local config_file
     if [ -n "$cli_config" ]; then
         if [ ! -f "$cli_config" ]; then
@@ -1679,6 +1705,7 @@ cmd_enter() {
     cpus="${cli_cpus:-${_cfg_cpus}}"
     network="${cli_network:-${_cfg_network:-1}}"
     local display="${cli_display:-${_cfg_display}}"
+    local image_size="${cli_image_size:-${_cfg_image_size}}"
     if [ "$follow_git_worktrees" != "1" ] && [ "${_cfg_follow_git_worktrees}" = "1" ]; then
         follow_git_worktrees=1
     fi
@@ -1714,7 +1741,7 @@ cmd_enter() {
     fi
 
     if [ "$need_export" = "1" ]; then
-        export_image "$name" "$cache_dir"
+        export_image "$name" "$cache_dir" "$image_size"
     fi
 
     local image="$cache_dir/$name.qcow2"
@@ -1775,9 +1802,9 @@ cmd_enter() {
             local resolved_git_dir
             resolved_git_dir=$(realpath "$git_common_dir" 2>/dev/null) || true
             if [ -n "$resolved_git_dir" ] && [ -d "$resolved_git_dir" ]; then
-                # Check if it's already covered by an existing rw mount
+                # Check if it's already covered by an existing mount
                 local already_exported=0
-                for d in "${rw_mount_dirs[@]}"; do
+                for d in "${rw_mount_dirs[@]}" "${ro_mount_dirs[@]}" "${cow_mount_dirs[@]}"; do
                     if [[ "$resolved_git_dir" = "$d" ]] || [[ "$resolved_git_dir" = "$d/"* ]]; then
                         already_exported=1
                         break
@@ -1877,9 +1904,9 @@ cmd_enter() {
 
     # Display adapter.  When --display is set, add a VGA device and
     # a GUI window so Xorg/Wayland can run inside the VM.
-    if [ -n "$display" ] && [ "$display" != "none" ]; then
+    if [ -n "$display" ]; then
         case "$display" in
-            virtio|qxl|std|cirrus|vmware) ;;
+            virtio|qxl|std|none|cirrus|vmware) ;;
             *) die "invalid --display type: '$display' (must be one of: virtio, qxl, std, none, cirrus, vmware)" ;;
         esac
         qemu_cmd+=(-vga "$display")
