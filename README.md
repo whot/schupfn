@@ -69,17 +69,23 @@ schupfn enter mybox --export-ro ~/src/other-project
 # Mount a directory read-write
 schupfn enter mybox --export-rw ~/src/work-in-progress
 
+# Mount a directory as copy-on-write (writable in VM, host unchanged)
+schupfn enter mybox --export-cow ~/src/reference-tree
+
 # Copy a file into the VM's home directory
 schupfn enter mybox --export-ro ~/.zshrc
 ```
 
 `--export-ro` mounts directories read-only at their original path.
-`--export-rw` does the same but read-write. Files are copied into the VM
-at their original absolute path (directory structure is preserved).
-Symlinks are followed -- a symlink pointing to a directory is mounted,
-one pointing to a file is copied.
+`--export-rw` does the same but read-write.
+`--export-cow` mounts directories read-only from the host but writable
+inside the VM via overlayfs -- writes go to a tmpfs upper layer and are
+lost when the VM shuts down. The host directory is never modified.
+Files are copied into the VM at their original absolute path (directory
+structure is preserved). Symlinks are followed -- a symlink pointing to
+a directory is mounted, one pointing to a file is copied.
 
-Both flags are repeatable, pass them as many times as you like.
+All flags are repeatable, pass them as many times as you like.
 
 ## Configuration files
 
@@ -127,6 +133,7 @@ Parsing requires [yq](https://github.com/mikefarah/yq).
 | `command`    | string        | Command to run instead of an interactive shell     |
 | `export-ro`  | list of paths | Read-only exports, same as `--export-ro`           |
 | `export-rw`  | list of paths | Read-write exports, same as `--export-rw`          |
+| `export-cow` | list of paths | Copy-on-write exports, same as `--export-cow`      |
 | `vm.memory`  | string        | VM memory, e.g. `4G`, `512M` (default: `4G`)       |
 | `vm.cpus`    | int           | VM CPU count (default: host CPU count)              |
 | `vm.network` | bool          | Set to `false` to disable the extra network device  |
@@ -142,6 +149,7 @@ Export the container and boot it as a VM.
 |----------------------|----------------------------------------------------------|
 | `--export-ro <path>` | Mount a directory read-only or copy a file (repeatable)  |
 | `--export-rw <path>` | Like `--export-ro`, but directories are mounted read-write|
+| `--export-cow <path>`| Writable in VM via overlayfs, host directory unchanged    |
 | `--command <cmd>`    | Run a command in the VM instead of an interactive shell   |
 | `--config <path>`    | Use a specific config file instead of searching for one   |
 | `--refresh`          | Force re-export of the disk image                         |

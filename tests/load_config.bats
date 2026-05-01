@@ -16,6 +16,7 @@ setup() {
     _cfg_cpus=""
     _cfg_network=""
     _cfg_display=""
+    _cfg_exports_cow=()
 }
 
 teardown() {
@@ -69,6 +70,19 @@ EOF
     [ "${#_cfg_exports_rw[@]}" -eq 2 ]
     [ "${_cfg_exports_rw[0]}" = "/tmp/xxx" ]
     [ "${_cfg_exports_rw[1]}" = "/tmp/yyy" ]
+}
+
+@test "load_config: parses export-cow list" {
+    yq_or_skip
+    cat > "$TMPDIR/config.yml" <<'EOF'
+export-cow:
+  - /tmp/cow1
+  - /tmp/cow2
+EOF
+    load_config "$TMPDIR/config.yml"
+    [ "${#_cfg_exports_cow[@]}" -eq 2 ]
+    [ "${_cfg_exports_cow[0]}" = "/tmp/cow1" ]
+    [ "${_cfg_exports_cow[1]}" = "/tmp/cow2" ]
 }
 
 @test "load_config: parses vm.memory" {
@@ -139,6 +153,7 @@ EOF
     [ "${#_cfg_exports[@]}" -eq 0 ]
     [ "${#_cfg_exports_rw[@]}" -eq 0 ]
     [ -z "$_cfg_display" ]
+    [ "${#_cfg_exports_cow[@]}" -eq 0 ]
     [ -z "$_cfg_memory" ]
     [ -z "$_cfg_cpus" ]
     [ -z "$_cfg_network" ]
@@ -165,6 +180,8 @@ export-ro:
   - /tmp/ro1
 export-rw:
   - /tmp/rw1
+export-cow:
+  - /tmp/cow1
 vm:
   memory: 16G
   cpus: 8
@@ -178,6 +195,8 @@ EOF
     [ "${_cfg_exports[0]}" = "/tmp/ro1" ]
     [ "${#_cfg_exports_rw[@]}" -eq 1 ]
     [ "${_cfg_exports_rw[0]}" = "/tmp/rw1" ]
+    [ "${#_cfg_exports_cow[@]}" -eq 1 ]
+    [ "${_cfg_exports_cow[0]}" = "/tmp/cow1" ]
     [ "$_cfg_memory" = "16G" ]
     [ "$_cfg_cpus" = "8" ]
     [ "$_cfg_network" = "0" ]
@@ -226,6 +245,8 @@ export-ro:
   - /tmp/aaa
 export-rw:
   - /tmp/bbb
+export-cow:
+  - /tmp/ccc
 vm:
   memory: 4G
   cpus: 2
