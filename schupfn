@@ -80,14 +80,14 @@ validate_container_name() {
 }
 
 # Classify a single export path as a directory or file.
-# Directories are appended to rw_mount_dirs or ro_mount_dirs (depending
-# on mode). Files are appended to dotfiles. Symlinks that point to a
-# directory also produce a rootfs_symlinks entry.
+# Directories are appended to rw_mount_dirs, ro_mount_dirs, or
+# cow_mount_dirs (depending on mode). Files are appended to dotfiles.
+# Symlinks that point to a directory also produce a rootfs_symlinks entry.
 #
 # These arrays must exist in the caller's scope:
-#   rw_mount_dirs, ro_mount_dirs, rootfs_symlinks, dotfiles
+#   rw_mount_dirs, ro_mount_dirs, cow_mount_dirs, rootfs_symlinks, dotfiles
 #
-# $1 = path, $2 = "rw" or "ro"
+# $1 = path, $2 = "rw", "ro", or "cow"
 classify_export() {
     local path="$1"
     local mode="$2"
@@ -100,11 +100,11 @@ classify_export() {
     if [ -d "$path" ]; then
         local resolved
         resolved="$(realpath "$path")"
-        if [ "$mode" = "rw" ]; then
-            rw_mount_dirs+=("$resolved")
-        else
-            ro_mount_dirs+=("$resolved")
-        fi
+        case "$mode" in
+            rw)  rw_mount_dirs+=("$resolved") ;;
+            ro)  ro_mount_dirs+=("$resolved") ;;
+            cow) cow_mount_dirs+=("$resolved") ;;
+        esac
 
         # If the path was a symlink, remember to recreate it in the rootfs
         local abs_dir
@@ -113,6 +113,9 @@ classify_export() {
             rootfs_symlinks+=("$abs_dir:$resolved")
         fi
     else
+        if [ "$mode" = "cow" ]; then
+            die "cannot use --export-cow with a file: $path (only directories are supported)"
+        fi
         # Regular file (or symlink to a file): use the absolute path of
         # the link itself (not its target) so the file is placed at the
         # original path inside the VM.  tar -h dereferences the symlink
@@ -123,44 +126,54 @@ classify_export() {
     fi
 }
 
-# Check for nested export conflicts between rw_mount_dirs and
-# ro_mount_dirs. A 9p mount on a parent directory shadows any child
-# mount, so --export-ro /foo --export-rw /foo/bar cannot work: the ro
-# mount on /foo makes everything beneath it read-only regardless of the
-# child mount.
+# Check for nested export conflicts between mount dir arrays.
+# A mount on a parent directory shadows any child mount, so
+# --export-ro /foo --export-rw /foo/bar cannot work.
 #
 # These arrays must exist in the caller's scope:
-#   rw_mount_dirs, ro_mount_dirs
+#   rw_mount_dirs, ro_mount_dirs, cow_mount_dirs
 check_nested_export_conflicts() {
-    local rw ro
-    for rw in "${rw_mount_dirs[@]}"; do
-        for ro in "${ro_mount_dirs[@]}"; do
-            # Exact same path exported as both ro and rw
-            if [[ "$rw" = "$ro" ]]; then
-                die "conflicting exports: '$rw' is exported as both" \
-                    "ro and rw. Remove one of the duplicate exports."
+    # Build a combined list of (path, mode) pairs to check
+    local -a all_paths=() all_modes=()
+    local d
+    for d in "${rw_mount_dirs[@]}"; do
+        all_paths+=("$d"); all_modes+=("rw")
+    done
+    for d in "${ro_mount_dirs[@]}"; do
+        all_paths+=("$d"); all_modes+=("ro")
+    done
+    for d in "${cow_mount_dirs[@]}"; do
+        all_paths+=("$d"); all_modes+=("cow")
+    done
+
+    local i j
+    for (( i=0; i<${#all_paths[@]}; i++ )); do
+        for (( j=i+1; j<${#all_paths[@]}; j++ )); do
+            local a="${all_paths[$i]}" a_mode="${all_modes[$i]}"
+            local b="${all_paths[$j]}" b_mode="${all_modes[$j]}"
+
+            # Same mode — nesting is redundant but not harmful
+            [[ "$a_mode" = "$b_mode" ]] && continue
+
+            # Exact same path with different modes
+            if [[ "$a" = "$b" ]]; then
+                die "conflicting exports: '$a' is exported as both" \
+                    "$a_mode and $b_mode. Remove one of the duplicate exports."
             fi
 
-            # Build a prefix that works for root "/" without producing
-            # a double-slash ("//child" would never match "/child").
-            local ro_prefix="$ro"
-            [[ "$ro_prefix" != "/" ]] && ro_prefix+="/"
-            local rw_prefix="$rw"
-            [[ "$rw_prefix" != "/" ]] && rw_prefix+="/"
+            local a_prefix="$a" b_prefix="$b"
+            [[ "$a_prefix" != "/" ]] && a_prefix+="/"
+            [[ "$b_prefix" != "/" ]] && b_prefix+="/"
 
-            # rw dir is a child of an ro dir
-            if [[ "$rw" = "$ro_prefix"* ]]; then
-                die "conflicting exports: '$rw' (rw) is nested inside" \
-                    "'$ro' (ro). The read-only mount on the parent" \
-                    "shadows the child. Remove one or export the parent" \
-                    "as rw."
+            if [[ "$b" = "$a_prefix"* ]]; then
+                die "conflicting exports: '$b' ($b_mode) is nested inside" \
+                    "'$a' ($a_mode). The mount on the parent shadows the" \
+                    "child. Remove one or use the same export mode for both."
             fi
-            # ro dir is a child of an rw dir
-            if [[ "$ro" = "$rw_prefix"* ]]; then
-                die "conflicting exports: '$ro' (ro) is nested inside" \
-                    "'$rw' (rw). The read-write mount on the parent" \
-                    "shadows the child. Remove one or export the parent" \
-                    "as ro."
+            if [[ "$a" = "$b_prefix"* ]]; then
+                die "conflicting exports: '$a' ($a_mode) is nested inside" \
+                    "'$b' ($b_mode). The mount on the parent shadows the" \
+                    "child. Remove one or use the same export mode for both."
             fi
         done
     done
@@ -641,6 +654,8 @@ load_config() {
         (.["export-ro"] // [] | .[]),
         "__EXPORT_RW__",
         (.["export-rw"] // [] | .[]),
+        "__EXPORT_COW__",
+        (.["export-cow"] // [] | .[]),
         "__KEYS__",
         ([.. | path | map(select(tag != "!!int")) | join(".")] | unique | .[])
     ' "$config_file" 2>/dev/null) || die "failed to parse config file: $config_file"
@@ -650,7 +665,7 @@ load_config() {
     local raw_cpus="" raw_network="" raw_key=""
     while IFS= read -r line; do
         case "$line" in
-            __SCALARS__|__EXPORT_RO__|__EXPORT_RW__|__KEYS__)
+            __SCALARS__|__EXPORT_RO__|__EXPORT_RW__|__EXPORT_COW__|__KEYS__)
                 section="$line"; continue ;;
         esac
 
@@ -680,9 +695,15 @@ load_config() {
                     _cfg_exports_rw+=("$line")
                 fi
                 ;;
+            __EXPORT_COW__)
+                if [ -n "$line" ]; then
+                    [[ "$line" != /* && "$line" != ~* ]] && line="$HOME/$line"
+                    _cfg_exports_cow+=("$line")
+                fi
+                ;;
             __KEYS__)
                 [ -z "$line" ] && continue
-                local _known_keys=" container command export-ro export-rw vm vm.memory vm.cpus vm.network vm.display ssh_key "
+                local _known_keys=" container command export-ro export-rw export-cow vm vm.memory vm.cpus vm.network vm.display ssh_key "
                 if [[ "$_known_keys" != *" $line "* ]]; then
                     warn "unknown config key '$line' in $config_file"
                 fi
@@ -741,6 +762,10 @@ Options:
                       Directories are mounted read-only at their original path.
                       Files are copied into the VM at their original path.
   --export-rw <path>  Like --export-ro, but directories are mounted read-write
+  --export-cow <path> Like --export-ro, but the directory is writable inside
+                      the VM via overlayfs (writes go to a tmpfs upper layer
+                      and are lost on VM shutdown; the host directory is never
+                      modified)
   --refresh         Force re-export of the image even if it appears fresh
   --deep-check      Use 'podman diff' for thorough staleness detection
   --memory <size>   VM memory, e.g. 4G, 512M (default: 4G)
@@ -768,6 +793,8 @@ Configuration file:
       - ~/.zshrc
     export-rw:
       - ~/src/work-in-progress
+    export-cow:
+      - ~/src/reference-tree
     vm:
       memory: 8G
       cpus: 4
@@ -1002,6 +1029,7 @@ generate_mount_script() {
 #!/bin/bash
 modprobe 9pnet_virtio 2>/dev/null
 modprobe 9p 2>/dev/null
+modprobe overlay 2>/dev/null
 sleep 0.5
 
 # Parse kernel command line
@@ -1031,16 +1059,42 @@ for param in $(cat /proc/cmdline); do
                 fi
             fi
             opts="trans=virtio,version=9p2000.L,msize=104857600"
-            [ "$mode" = "ro" ] && opts="$opts,ro"
-            mounted=0
-            for i in 1 2 3; do
-                if mount -t 9p -o "$opts" "$tag" "$path" 2>/dev/null; then
-                    mounted=1; break
+
+            if [ "$mode" = "cow" ]; then
+                # Copy-on-write: mount 9p read-only at a hidden path,
+                # then overlay it at the target path with a tmpfs upper
+                lower="/run/schupfn/lower/$tag"
+                upper="/run/schupfn/upper/$tag"
+                work="/run/schupfn/work/$tag"
+                mkdir -p "$lower" "$upper" "$work"
+                mounted=0
+                for i in 1 2 3; do
+                    if mount -t 9p -o "$opts,ro" "$tag" "$lower" 2>/dev/null; then
+                        mounted=1; break
+                    fi
+                    sleep 0.5
+                done
+                if [ "$mounted" = "1" ]; then
+                    if ! mount -t overlay overlay \
+                            -o "lowerdir=$lower,upperdir=$upper,workdir=$work" \
+                            "$path" 2>/dev/null; then
+                        echo "schupfn-mounts: failed to overlay $tag at $path" >&2
+                    fi
+                else
+                    echo "schupfn-mounts: failed to mount 9p $tag for cow" >&2
                 fi
-                sleep 0.5
-            done
-            if [ "$mounted" = "0" ]; then
-                echo "schupfn-mounts: failed to mount $tag at $path" >&2
+            else
+                [ "$mode" = "ro" ] && opts="$opts,ro"
+                mounted=0
+                for i in 1 2 3; do
+                    if mount -t 9p -o "$opts" "$tag" "$path" 2>/dev/null; then
+                        mounted=1; break
+                    fi
+                    sleep 0.5
+                done
+                if [ "$mounted" = "0" ]; then
+                    echo "schupfn-mounts: failed to mount $tag at $path" >&2
+                fi
             fi
             ;;
     esac
@@ -1448,6 +1502,7 @@ cmd_enter() {
     local cli_config=""
     local -a exports=()
     local -a exports_rw=()
+    local -a exports_cow=()
     local cli_memory="" cli_cpus="" cli_network="" cli_display=""
 
     while [ $# -gt 0 ]; do
@@ -1464,6 +1519,11 @@ cmd_enter() {
             --export-rw)
                 [ $# -ge 2 ] || die "--export-rw requires an argument"
                 exports_rw+=("$2")
+                shift 2
+                ;;
+            --export-cow)
+                [ $# -ge 2 ] || die "--export-cow requires an argument"
+                exports_cow+=("$2")
                 shift 2
                 ;;
             --dotfile)
@@ -1535,6 +1595,7 @@ cmd_enter() {
     # Config values provide defaults; CLI arguments always take precedence.
     local -a _cfg_exports=()
     local -a _cfg_exports_rw=()
+    local -a _cfg_exports_cow=()
     local _cfg_container="" _cfg_command="" _cfg_memory="" _cfg_cpus="" _cfg_network="" _cfg_display="" _cfg_ssh_key=""
     local config_file
     if [ -n "$cli_config" ]; then
@@ -1562,6 +1623,7 @@ cmd_enter() {
     # Merge: config exports come first, CLI exports are appended
     exports=("${_cfg_exports[@]}" "${exports[@]}")
     exports_rw=("${_cfg_exports_rw[@]}" "${exports_rw[@]}")
+    exports_cow=("${_cfg_exports_cow[@]}" "${exports_cow[@]}")
 
     # Scalars: CLI wins, then config, then built-in default
     memory="${cli_memory:-${_cfg_memory:-4G}}"
@@ -1613,9 +1675,10 @@ cmd_enter() {
             "it may have been deleted or permissions are insufficient."
     fi
 
-    # Classify each --export-ro / --export-rw path as a directory or file.
+    # Classify each export path as a directory or file.
     local -a rw_mount_dirs=("$physical_pwd")   # $PWD is always read-write
     local -a ro_mount_dirs=()
+    local -a cow_mount_dirs=()
     local -a rootfs_symlinks=()
     local -a dotfiles=()
 
@@ -1629,6 +1692,9 @@ cmd_enter() {
     done
     for path in "${exports_rw[@]}"; do
         classify_export "$path" "rw"
+    done
+    for path in "${exports_cow[@]}"; do
+        classify_export "$path" "cow"
     done
 
     check_nested_export_conflicts
@@ -1768,6 +1834,14 @@ cmd_enter() {
         info "exporting directory (ro): $dir"
         qemu_cmd+=(-virtfs "local,path=$dir,mount_tag=$tag,security_model=none,id=fs${fs_idx},readonly=on")
         kernel_args+=("schupfn.9p=${tag}:${dir}:ro")
+        fs_idx=$((fs_idx + 1))
+    done
+
+    for dir in "${cow_mount_dirs[@]}"; do
+        local tag="schupfn_cow_${fs_idx}"
+        info "exporting directory (cow): $dir"
+        qemu_cmd+=(-virtfs "local,path=$dir,mount_tag=$tag,security_model=none,id=fs${fs_idx},readonly=on")
+        kernel_args+=("schupfn.9p=${tag}:${dir}:cow")
         fs_idx=$((fs_idx + 1))
     done
 
