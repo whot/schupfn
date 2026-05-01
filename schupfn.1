@@ -117,6 +117,13 @@ Use
 for more thorough staleness detection when deciding whether to
 re\-export.
 .TP
+.BI \-\-image\-size " size"
+Size of the qcow2 disk image, e.g.\&
+.BR 4G ,
+.BR 10G .
+If not specified, the image is auto\-sized from the container
+(tarball size + 50% headroom, minimum 2G).
+.TP
 .BI \-\-memory " size"
 Amount of memory for the VM, e.g.\&
 .BR 4G ,
@@ -275,6 +282,14 @@ Same as
 Automatically export the main git directory when working in a git worktree.
 Same as
 .BR \-\-follow\-git\-worktrees .
+.TP
+.B image\-size
+.RI ( string )
+Size of the qcow2 disk image, e.g.\&
+.BR 4G ,
+.BR 10G .
+Same as
+.BR \-\-image\-size .
 .TP
 .B vm.memory
 .RI ( string )

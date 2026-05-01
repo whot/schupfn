@@ -12,12 +12,13 @@ setup() {
     _cfg_command=""
     _cfg_exports=()
     _cfg_exports_rw=()
+    _cfg_exports_cow=()
     _cfg_memory=""
     _cfg_cpus=""
     _cfg_network=""
     _cfg_display=""
-    _cfg_exports_cow=()
     _cfg_follow_git_worktrees=""
+    _cfg_image_size=""
 }
 
 teardown() {
@@ -144,6 +145,15 @@ EOF
     [ -z "$_cfg_follow_git_worktrees" ]
 }
 
+@test "load_config: parses image-size" {
+    yq_or_skip
+    cat > "$TMPDIR/config.yml" <<'EOF'
+image-size: 10G
+EOF
+    load_config "$TMPDIR/config.yml"
+    [ "$_cfg_image_size" = "10G" ]
+}
+
 @test "load_config: parses vm.display" {
     yq_or_skip
     cat > "$TMPDIR/config.yml" <<'EOF'
@@ -152,6 +162,15 @@ vm:
 EOF
     load_config "$TMPDIR/config.yml"
     [ "$_cfg_display" = "virtio" ]
+}
+
+@test "load_config: warns on obsolete ssh_key field" {
+    yq_or_skip
+    cat > "$TMPDIR/config.yml" <<'EOF'
+ssh_key: ~/.ssh/test_key
+EOF
+    load_config "$TMPDIR/config.yml"
+    assert_warned "unknown config key 'ssh_key'"
 }
 
 @test "load_config: dies on invalid YAML" {
@@ -171,9 +190,10 @@ EOF
     [ -z "$_cfg_command" ]
     [ "${#_cfg_exports[@]}" -eq 0 ]
     [ "${#_cfg_exports_rw[@]}" -eq 0 ]
-    [ -z "$_cfg_display" ]
     [ "${#_cfg_exports_cow[@]}" -eq 0 ]
+    [ -z "$_cfg_display" ]
     [ -z "$_cfg_follow_git_worktrees" ]
+    [ -z "$_cfg_image_size" ]
     [ -z "$_cfg_memory" ]
     [ -z "$_cfg_cpus" ]
     [ -z "$_cfg_network" ]
@@ -203,6 +223,7 @@ export-rw:
 export-cow:
   - /tmp/cow1
 follow-git-worktrees: true
+image-size: 10G
 vm:
   memory: 16G
   cpus: 8
@@ -219,6 +240,7 @@ EOF
     [ "${#_cfg_exports_cow[@]}" -eq 1 ]
     [ "${_cfg_exports_cow[0]}" = "/tmp/cow1" ]
     [ "$_cfg_follow_git_worktrees" = "1" ]
+    [ "$_cfg_image_size" = "10G" ]
     [ "$_cfg_memory" = "16G" ]
     [ "$_cfg_cpus" = "8" ]
     [ "$_cfg_network" = "0" ]
@@ -270,6 +292,7 @@ export-rw:
 export-cow:
   - /tmp/ccc
 follow-git-worktrees: true
+image-size: 10G
 vm:
   memory: 4G
   cpus: 2
