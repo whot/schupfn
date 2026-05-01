@@ -15,7 +15,7 @@ setup() {
     _cfg_memory=""
     _cfg_cpus=""
     _cfg_network=""
-
+    _cfg_display=""
 }
 
 teardown() {
@@ -111,6 +111,15 @@ EOF
     [ -z "$_cfg_network" ]
 }
 
+@test "load_config: parses vm.display" {
+    yq_or_skip
+    cat > "$TMPDIR/config.yml" <<'EOF'
+vm:
+  display: virtio
+EOF
+    load_config "$TMPDIR/config.yml"
+    [ "$_cfg_display" = "virtio" ]
+}
 
 @test "load_config: dies on invalid YAML" {
     yq_or_skip
@@ -129,6 +138,7 @@ EOF
     [ -z "$_cfg_command" ]
     [ "${#_cfg_exports[@]}" -eq 0 ]
     [ "${#_cfg_exports_rw[@]}" -eq 0 ]
+    [ -z "$_cfg_display" ]
     [ -z "$_cfg_memory" ]
     [ -z "$_cfg_cpus" ]
     [ -z "$_cfg_network" ]
@@ -159,7 +169,7 @@ vm:
   memory: 16G
   cpus: 8
   network: false
-
+  display: virtio
 EOF
     load_config "$TMPDIR/config.yml"
     [ "$_cfg_container" = "full-test" ]
@@ -171,7 +181,7 @@ EOF
     [ "$_cfg_memory" = "16G" ]
     [ "$_cfg_cpus" = "8" ]
     [ "$_cfg_network" = "0" ]
-
+    [ "$_cfg_display" = "virtio" ]
 }
 
 @test "load_config: warns on unknown top-level key" {
@@ -220,6 +230,7 @@ vm:
   memory: 4G
   cpus: 2
   network: false
+  display: virtio
 EOF
     load_config "$TMPDIR/config.yml"
     assert_no_warnings
