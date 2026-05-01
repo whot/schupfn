@@ -134,6 +134,7 @@ Parsing requires [yq](https://github.com/mikefarah/yq).
 | `export-ro`  | list of paths | Read-only exports, same as `--export-ro`           |
 | `export-rw`  | list of paths | Read-write exports, same as `--export-rw`          |
 | `export-cow` | list of paths | Copy-on-write exports, same as `--export-cow`      |
+| `follow-git-worktrees` | bool | Auto-export main git dir for worktrees              |
 | `vm.memory`  | string        | VM memory, e.g. `4G`, `512M` (default: `4G`)       |
 | `vm.cpus`    | int           | VM CPU count (default: host CPU count)              |
 | `vm.network` | bool          | Set to `false` to disable the extra network device  |
@@ -157,6 +158,7 @@ Export the container and boot it as a VM.
 | `--memory <size>`    | VM memory (default: `4G`)                                 |
 | `--cpus <n>`         | VM CPU count                                              |
 | `--no-network`       | Disable the extra network device (SSH still works)        |
+| `--follow-git-worktrees` | Auto-export main git dir when in a worktree          |
 | `--display <type>`   | Add a display adapter (`virtio`, `qxl`, `std`)            |
 | `--console`          | Boot with serial console instead of SSH (for debugging)   |
 | `--verbose`          | Show VM boot output                                       |

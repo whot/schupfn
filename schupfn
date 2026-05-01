@@ -664,6 +664,7 @@ load_config() {
         "cpus="      + ((.vm.cpus // "") | tostring),
         "network="   + (.vm.network | tostring),
         "display="   + (.vm.display // ""),
+        "follow_git_worktrees=" + (.["follow-git-worktrees"] | tostring),
         "__EXPORT_RO__",
         (.["export-ro"] // [] | .[]),
         "__EXPORT_RW__",
@@ -676,7 +677,7 @@ load_config() {
 
     # Parse the blob line by line — zero additional forks.
     local section="" line
-    local raw_cpus="" raw_network=""
+    local raw_cpus="" raw_network="" raw_follow_git_worktrees=""
     while IFS= read -r line; do
         case "$line" in
             __SCALARS__|__EXPORT_RO__|__EXPORT_RW__|__EXPORT_COW__|__KEYS__)
@@ -694,6 +695,7 @@ load_config() {
                     cpus)      raw_cpus="$val" ;;
                     network)   raw_network="$val" ;;
                     display)   _cfg_display="$val" ;;
+                    follow_git_worktrees) raw_follow_git_worktrees="$val" ;;
                 esac
                 ;;
             __EXPORT_RO__)
@@ -716,7 +718,7 @@ load_config() {
                 ;;
             __KEYS__)
                 [ -z "$line" ] && continue
-                local _known_keys=" container command export-ro export-rw export-cow vm vm.memory vm.cpus vm.network vm.display "
+                local _known_keys=" container command export-ro export-rw export-cow follow-git-worktrees vm vm.memory vm.cpus vm.network vm.display "
                 if [[ "$_known_keys" != *" $line "* ]]; then
                     warn "unknown config key '$line' in $config_file"
                 fi
@@ -730,7 +732,8 @@ load_config() {
     if [ "$raw_network" = "false" ]; then
         _cfg_network="0"
     fi
-
+    if [ "$raw_follow_git_worktrees" = "true" ]; then
+        _cfg_follow_git_worktrees="1"
     fi
 }
 
@@ -780,6 +783,9 @@ Options:
   --cpus <n>        VM CPU count (default: host CPU count)
   --command <cmd>   Run <cmd> in the VM instead of an interactive shell
   --config <path>   Use <path> as config file instead of searching for one
+  --follow-git-worktrees
+                    If \$PWD is a git worktree, automatically export the main
+                    git directory read-write so git operations work in the VM
   --no-network      Disable the extra network device (SSH network device remains)
   --display <type>  Add a display adapter (e.g. virtio, qxl, std) for running
                     Xorg or Wayland inside the VM
@@ -803,6 +809,7 @@ Configuration file:
       - ~/src/work-in-progress
     export-cow:
       - ~/src/reference-tree
+    follow-git-worktrees: true
     vm:
       memory: 8G
       cpus: 4
@@ -1520,6 +1527,7 @@ cmd_enter() {
     local -a exports_rw=()
     local -a exports_cow=()
     local cli_memory="" cli_cpus="" cli_network="" cli_display=""
+    local follow_git_worktrees=0
 
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -1586,6 +1594,10 @@ cmd_enter() {
                 verbose=1
                 shift
                 ;;
+            --follow-git-worktrees)
+                follow_git_worktrees=1
+                shift
+                ;;
             --console)
                 console=1
                 shift
@@ -1612,7 +1624,7 @@ cmd_enter() {
     local -a _cfg_exports=()
     local -a _cfg_exports_rw=()
     local -a _cfg_exports_cow=()
-    local _cfg_container="" _cfg_command="" _cfg_memory="" _cfg_cpus="" _cfg_network="" _cfg_display=""
+    local _cfg_container="" _cfg_command="" _cfg_memory="" _cfg_cpus="" _cfg_network="" _cfg_display="" _cfg_follow_git_worktrees=""
     local config_file
     if [ -n "$cli_config" ]; then
         if [ ! -f "$cli_config" ]; then
@@ -1646,6 +1658,9 @@ cmd_enter() {
     cpus="${cli_cpus:-${_cfg_cpus}}"
     network="${cli_network:-${_cfg_network:-1}}"
     local display="${cli_display:-${_cfg_display}}"
+    if [ "$follow_git_worktrees" != "1" ] && [ "${_cfg_follow_git_worktrees}" = "1" ]; then
+        follow_git_worktrees=1
+    fi
     if [ -z "$command" ]; then
         command="${_cfg_command}"
     fi
@@ -1725,6 +1740,35 @@ cmd_enter() {
     for path in "${exports_cow[@]}"; do
         classify_export "$path" "cow"
     done
+
+    # If --follow-git-worktrees is set and $PWD is a git worktree,
+    # automatically export the git common directory (the main .git dir)
+    # so that git operations work inside the VM.
+    if [ "$follow_git_worktrees" = "1" ]; then
+        local git_common_dir
+        git_common_dir=$(git -C "$physical_pwd" rev-parse --git-common-dir 2>/dev/null) || true
+        if [ -n "$git_common_dir" ] && [ "$git_common_dir" != ".git" ]; then
+            # It's a worktree — git_common_dir is a path (absolute or
+            # relative) to the main .git directory.  Resolve it and add
+            # as rw export if not already covered by an existing mount.
+            local resolved_git_dir
+            resolved_git_dir=$(realpath "$git_common_dir" 2>/dev/null) || true
+            if [ -n "$resolved_git_dir" ] && [ -d "$resolved_git_dir" ]; then
+                # Check if it's already covered by an existing rw mount
+                local already_exported=0
+                for d in "${rw_mount_dirs[@]}"; do
+                    if [[ "$resolved_git_dir" = "$d" ]] || [[ "$resolved_git_dir" = "$d/"* ]]; then
+                        already_exported=1
+                        break
+                    fi
+                done
+                if [ "$already_exported" = "0" ]; then
+                    info "exporting git common dir (worktree): $resolved_git_dir"
+                    rw_mount_dirs+=("$resolved_git_dir")
+                fi
+            fi
+        fi
+    fi
 
     check_nested_export_conflicts
 
