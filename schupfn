@@ -878,13 +878,14 @@ read_meta() {
 gather_container_state() {
     local name="$1"
 
-    # One podman inspect: --format gives us both IDs on separate lines.
-    local ids
-    ids=$(podman inspect --format '{{.Image}}{{"\n"}}{{.Id}}' "$name" 2>/dev/null) \
+    # One podman inspect: --format gives us both IDs and the last
+    # started timestamp on separate lines.
+    local state_info
+    state_info=$(podman inspect --format '{{.Image}}{{"\n"}}{{.Id}}{{"\n"}}{{.State.StartedAt}}' "$name" 2>/dev/null) \
         || die "failed to inspect container '$name'"
 
-    local image_id container_id
-    { read -r image_id; read -r container_id; } <<< "$ids"
+    local image_id container_id started_at
+    { read -r image_id; read -r container_id; read -r started_at; } <<< "$state_info"
 
     if [ -z "$image_id" ]; then
         die "failed to get image ID for container '$name'"
@@ -905,6 +906,7 @@ gather_container_state() {
     echo "image_id=$image_id"
     echo "container_id=$container_id"
     echo "inspect_hash=$inspect_hash"
+    echo "started_at=$started_at"
 }
 
 # Check whether the cached image is fresh.
@@ -928,12 +930,13 @@ check_freshness() {
     local current_state
     current_state=$(gather_container_state "$name")
 
-    local current_image_id="" current_container_id="" current_inspect_hash=""
+    local current_image_id="" current_container_id="" current_inspect_hash="" current_started_at=""
     while IFS='=' read -r k v; do
         case "$k" in
             image_id)       current_image_id="$v" ;;
             container_id)   current_container_id="$v" ;;
             inspect_hash)   current_inspect_hash="$v" ;;
+            started_at)     current_started_at="$v" ;;
         esac
     done <<< "$current_state"
 
@@ -950,6 +953,24 @@ check_freshness() {
     if [ "$stored_inspect_hash" != "$current_inspect_hash" ]; then
         info "container configuration changed for '$name'"
         return 1
+    fi
+
+    # Check if the container was started after the last export.
+    # When the user runs "toolbox run -c <name> sudo dnf install ...",
+    # the container is started, which updates StartedAt.  If this is
+    # newer than our export timestamp, the container may have changed.
+    local stored_exported_at
+    stored_exported_at=$(read_meta "$cache_dir" "exported_at")
+    if [ -n "$current_started_at" ] && [ -n "$stored_exported_at" ]; then
+        # Compare timestamps — both are ISO 8601 format, sortable
+        # as strings.  Normalize to comparable format.
+        local export_ts start_ts
+        export_ts=$(date -d "$stored_exported_at" +%s 2>/dev/null) || export_ts=0
+        start_ts=$(date -d "$current_started_at" +%s 2>/dev/null) || start_ts=0
+        if [ "$start_ts" -gt "$export_ts" ]; then
+            info "container '$name' was started after last export"
+            return 1
+        fi
     fi
 
     if [ "$deep_check" = "1" ]; then
