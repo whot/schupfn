@@ -130,6 +130,7 @@ Parsing requires [yq](https://github.com/mikefarah/yq).
 | `vm.memory`  | string        | VM memory, e.g. `4G`, `512M` (default: `4G`)       |
 | `vm.cpus`    | int           | VM CPU count (default: host CPU count)              |
 | `vm.network` | bool          | Set to `false` to disable the extra network device  |
+| `vm.display` | string        | Display adapter: `virtio`, `qxl`, `std` (default: none) |
 
 ## Commands
 
@@ -148,6 +149,7 @@ Export the container and boot it as a VM.
 | `--memory <size>`    | VM memory (default: `4G`)                                 |
 | `--cpus <n>`         | VM CPU count                                              |
 | `--no-network`       | Disable the extra network device (SSH still works)        |
+| `--display <type>`   | Add a display adapter (`virtio`, `qxl`, `std`)            |
 | `--console`          | Boot with serial console instead of SSH (for debugging)   |
 | `--verbose`          | Show VM boot output                                       |
 
