@@ -122,6 +122,17 @@ Defaults to the host CPU count.
 Disable the extra user\-mode network device.
 The internal SSH network device is unaffected.
 .TP
+.BI \-\-display " type"
+Add a display adapter to the VM.
+.I type
+is the qemu VGA model, e.g.\&
+.BR virtio ,
+.BR qxl ,
+or
+.BR std .
+This is needed to run Xorg or Wayland compositors inside the VM.
+Without this flag, the VM has no display adapter.
+.TP
 .B \-\-console
 Boot with the serial console on stdio instead of connecting via SSH.
 Useful for debugging boot issues.
@@ -257,6 +268,15 @@ Set to
 to disable the extra network device.
 Same as
 .BR \-\-no\-network .
+.TP
+.B vm.display
+.RI ( string )
+Display adapter model (e.g.\&
+.BR virtio ,
+.BR qxl ,
+.BR std ).
+Same as
+.BR \-\-display .
 .SS Example
 .PP
 .in +4n

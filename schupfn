@@ -635,6 +635,7 @@ load_config() {
         "memory="    + (.vm.memory // ""),
         "cpus="      + ((.vm.cpus // "") | tostring),
         "network="   + (.vm.network | tostring),
+        "display="   + (.vm.display // ""),
         "ssh_key="   + (.ssh_key // ""),
         "__EXPORT_RO__",
         (.["export-ro"] // [] | .[]),
@@ -663,6 +664,7 @@ load_config() {
                     memory)    _cfg_memory="$val" ;;
                     cpus)      raw_cpus="$val" ;;
                     network)   raw_network="$val" ;;
+                    display)   _cfg_display="$val" ;;
                     ssh_key)   raw_key="$val" ;;
                 esac
                 ;;
@@ -680,7 +682,7 @@ load_config() {
                 ;;
             __KEYS__)
                 [ -z "$line" ] && continue
-                local _known_keys=" container command export-ro export-rw vm vm.memory vm.cpus vm.network ssh_key "
+                local _known_keys=" container command export-ro export-rw vm vm.memory vm.cpus vm.network vm.display ssh_key "
                 if [[ "$_known_keys" != *" $line "* ]]; then
                     warn "unknown config key '$line' in $config_file"
                 fi
@@ -746,6 +748,8 @@ Options:
   --command <cmd>   Run <cmd> in the VM instead of an interactive shell
   --config <path>   Use <path> as config file instead of searching for one
   --no-network      Disable the extra network device (SSH network device remains)
+  --display <type>  Add a display adapter (e.g. virtio, qxl, std) for running
+                    Xorg or Wayland inside the VM
   --console         Boot with serial console on stdio instead of SSH (for debugging)
   --verbose         Show VM boot output
   -h, --help        Show this help
@@ -768,6 +772,7 @@ Configuration file:
       memory: 8G
       cpus: 4
       network: false
+      display: virtio
 EOF
 }
 
@@ -1443,7 +1448,7 @@ cmd_enter() {
     local cli_config=""
     local -a exports=()
     local -a exports_rw=()
-    local cli_memory="" cli_cpus="" cli_network=""
+    local cli_memory="" cli_cpus="" cli_network="" cli_display=""
 
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -1496,6 +1501,11 @@ cmd_enter() {
                 cli_network="0"
                 shift
                 ;;
+            --display)
+                [ $# -ge 2 ] || die "--display requires an argument (e.g. virtio, qxl, std)"
+                cli_display="$2"
+                shift 2
+                ;;
             --verbose)
                 verbose=1
                 shift
@@ -1525,7 +1535,7 @@ cmd_enter() {
     # Config values provide defaults; CLI arguments always take precedence.
     local -a _cfg_exports=()
     local -a _cfg_exports_rw=()
-    local _cfg_container="" _cfg_command="" _cfg_memory="" _cfg_cpus="" _cfg_network="" _cfg_ssh_key=""
+    local _cfg_container="" _cfg_command="" _cfg_memory="" _cfg_cpus="" _cfg_network="" _cfg_display="" _cfg_ssh_key=""
     local config_file
     if [ -n "$cli_config" ]; then
         if [ ! -f "$cli_config" ]; then
@@ -1557,6 +1567,7 @@ cmd_enter() {
     memory="${cli_memory:-${_cfg_memory:-4G}}"
     cpus="${cli_cpus:-${_cfg_cpus}}"
     network="${cli_network:-${_cfg_network:-1}}"
+    local display="${cli_display:-${_cfg_display}}"
     if [ -z "$command" ]; then
         command="${_cfg_command}"
     fi
@@ -1675,6 +1686,7 @@ cmd_enter() {
         "console=ttyS0,115200"
         "init=/sbin/init"
         "enforcing=0"
+        "idle=halt"
         "systemd.condition-needs-update="
         "schupfn.container=$name"
         "schupfn.chdir=$PWD"
@@ -1688,16 +1700,12 @@ cmd_enter() {
 
     # Build qemu command.
     #
-    # -display none:  no GUI window
-    # -vga none:      no video device (saves memory, avoids display probes)
     # -no-reboot:     exit on guest reboot/crash instead of looping
     local -a qemu_cmd=(
         qemu-system-x86_64
         -enable-kvm
         -cpu host
         -m "$memory"
-        -display none
-        -vga none
         -no-reboot
         -kernel "$kernel"
         -drive "file=$session_image,format=qcow2,if=virtio"
@@ -1705,6 +1713,14 @@ cmd_enter() {
 
     if [ -n "$initramfs" ]; then
         qemu_cmd+=(-initrd "$initramfs")
+    fi
+
+    # Display adapter.  When --display is set, add a VGA device and
+    # a GUI window so Xorg/Wayland can run inside the VM.
+    if [ -n "$display" ]; then
+        qemu_cmd+=(-vga "$display")
+    else
+        qemu_cmd+=(-display none -vga none)
     fi
 
     # Serial console setup depends on mode:
