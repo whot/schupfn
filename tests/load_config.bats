@@ -17,6 +17,7 @@ setup() {
     _cfg_network=""
     _cfg_display=""
     _cfg_exports_cow=()
+    _cfg_follow_git_worktrees=""
 }
 
 teardown() {
@@ -125,6 +126,24 @@ EOF
     [ -z "$_cfg_network" ]
 }
 
+@test "load_config: follow-git-worktrees true sets _cfg_follow_git_worktrees to 1" {
+    yq_or_skip
+    cat > "$TMPDIR/config.yml" <<'EOF'
+follow-git-worktrees: true
+EOF
+    load_config "$TMPDIR/config.yml"
+    [ "$_cfg_follow_git_worktrees" = "1" ]
+}
+
+@test "load_config: follow-git-worktrees false leaves _cfg_follow_git_worktrees empty" {
+    yq_or_skip
+    cat > "$TMPDIR/config.yml" <<'EOF'
+follow-git-worktrees: false
+EOF
+    load_config "$TMPDIR/config.yml"
+    [ -z "$_cfg_follow_git_worktrees" ]
+}
+
 @test "load_config: parses vm.display" {
     yq_or_skip
     cat > "$TMPDIR/config.yml" <<'EOF'
@@ -154,6 +173,7 @@ EOF
     [ "${#_cfg_exports_rw[@]}" -eq 0 ]
     [ -z "$_cfg_display" ]
     [ "${#_cfg_exports_cow[@]}" -eq 0 ]
+    [ -z "$_cfg_follow_git_worktrees" ]
     [ -z "$_cfg_memory" ]
     [ -z "$_cfg_cpus" ]
     [ -z "$_cfg_network" ]
@@ -182,6 +202,7 @@ export-rw:
   - /tmp/rw1
 export-cow:
   - /tmp/cow1
+follow-git-worktrees: true
 vm:
   memory: 16G
   cpus: 8
@@ -197,6 +218,7 @@ EOF
     [ "${_cfg_exports_rw[0]}" = "/tmp/rw1" ]
     [ "${#_cfg_exports_cow[@]}" -eq 1 ]
     [ "${_cfg_exports_cow[0]}" = "/tmp/cow1" ]
+    [ "$_cfg_follow_git_worktrees" = "1" ]
     [ "$_cfg_memory" = "16G" ]
     [ "$_cfg_cpus" = "8" ]
     [ "$_cfg_network" = "0" ]
@@ -247,6 +269,7 @@ export-rw:
   - /tmp/bbb
 export-cow:
   - /tmp/ccc
+follow-git-worktrees: true
 vm:
   memory: 4G
   cpus: 2

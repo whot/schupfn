@@ -128,6 +128,11 @@ The default is
 Number of CPUs for the VM.
 Defaults to the host CPU count.
 .TP
+.B \-\-follow\-git\-worktrees
+If the current directory is a git worktree, automatically export the
+main git directory read\-write so that git operations work correctly
+inside the VM.
+.TP
 .B \-\-no\-network
 Disable the extra user\-mode network device.
 The internal SSH network device is unaffected.
@@ -264,6 +269,12 @@ Same as
 Paths to export with copy\-on\-write overlay.
 Same as
 .BR \-\-export\-cow .
+.TP
+.B follow\-git\-worktrees
+.RI ( bool )
+Automatically export the main git directory when working in a git worktree.
+Same as
+.BR \-\-follow\-git\-worktrees .
 .TP
 .B vm.memory
 .RI ( string )
