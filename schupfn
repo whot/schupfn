@@ -1333,8 +1333,8 @@ SSHD_CONF
     _bwrite /etc/systemd/system/schupfn-sshd.service 0644 <<'SSHD_SVC'
 [Unit]
 Description=schupfn SSH server
-After=network.target sshd-keygen.target schupfn-network.service
-Wants=sshd-keygen.target
+After=network.target sshd-keygen.target schupfn-network.service schupfn-mounts.service
+Wants=sshd-keygen.target schupfn-mounts.service
 
 [Service]
 ExecStart=/usr/sbin/sshd -D -f /etc/ssh/sshd_config_schupfn -e
@@ -2038,31 +2038,8 @@ cmd_enter() {
         die "SSH authentication failed for user '$username'"
     fi
 
-    # Wait for 9p mounts to be ready (the mount service runs in parallel
-    # with sshd startup).  Check if the physical PWD (the actual 9p
-    # mount point) exists inside the VM.  We check the physical path
-    # because the logical path may be a symlink that doesn't exist yet
-    # (symlinks are created after the mounts are ready).
-    local mount_timeout=30
-    local mount_elapsed=0
-    while [ "$mount_elapsed" -lt "$mount_timeout" ]; do
-        if ssh "${ssh_opts[@]}" -o BatchMode=yes \
-               -l "$username" \
-               127.0.0.1 "test -d '$physical_pwd'" 2>/dev/null; then
-            break
-        fi
-        if [ "$mount_elapsed" = "0" ]; then
-            info "waiting for 9p mounts..."
-        fi
-        sleep 1
-        mount_elapsed=$((mount_elapsed + 1))
-    done
-    if [ "$mount_elapsed" -ge "$mount_timeout" ]; then
-        warn "timed out waiting for $PWD to appear in VM (9p mounts may have failed)"
-    fi
-
     # Create symlinks inside the VM for any symlinked export paths.
-    # This runs after the mount wait so the symlink targets are available.
+    # The mounts are already ready (sshd waits for schupfn-mounts.service).
     if [ ${#rootfs_symlinks[@]} -gt 0 ]; then
         local symlink_script=""
         for entry in "${rootfs_symlinks[@]}"; do
