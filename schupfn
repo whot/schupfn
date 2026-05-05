@@ -1114,13 +1114,13 @@ for param in $(cat /proc/cmdline); do
 done
 
 # Fix home directory ownership.  The container export produces files
-# owned by root; this fixes them to the actual user.  Runs at boot
-# as real root (not in a user namespace), so it always works.
+# owned by root; this fixes them to the actual user.  Uses find with
+# -xdev to stay on the rootfs and not traverse into 9p/overlay mounts.
 if [ -n "$schupfn_user" ] && [ -n "$schupfn_home" ] && [ -d "$schupfn_home" ]; then
     uid=$(id -u "$schupfn_user" 2>/dev/null)
     gid=$(id -g "$schupfn_user" 2>/dev/null)
     if [ -n "$uid" ] && [ -n "$gid" ]; then
-        chown -R "$uid:$gid" "$schupfn_home"
+        find "$schupfn_home" -xdev -exec chown "$uid:$gid" {} + 2>/dev/null || true
     fi
 fi
 SCRIPT
