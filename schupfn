@@ -1974,13 +1974,16 @@ cmd_enter() {
     fi
 
     # Wait for 9p mounts to be ready (the mount service runs in parallel
-    # with sshd startup).  Check if $PWD exists inside the VM.
+    # with sshd startup).  Check if the physical PWD (the actual 9p
+    # mount point) exists inside the VM.  We check the physical path
+    # because the logical path may be a symlink that doesn't exist yet
+    # (symlinks are created after the mounts are ready).
     local mount_timeout=30
     local mount_elapsed=0
     while [ "$mount_elapsed" -lt "$mount_timeout" ]; do
         if ssh "${ssh_opts[@]}" -o BatchMode=yes \
                -l "$username" \
-               127.0.0.1 "test -d '$PWD'" 2>/dev/null; then
+               127.0.0.1 "test -d '$physical_pwd'" 2>/dev/null; then
             break
         fi
         if [ "$mount_elapsed" = "0" ]; then
