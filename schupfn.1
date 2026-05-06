@@ -2,6 +2,10 @@
 .SH NAME
 schupfn \- run toolbox containers in virtual machines
 .SH SYNOPSIS
+.B schupfn create
+.RI [ name ]
+.RI [ options ]
+.br
 .B schupfn enter
 .RI [ name ]
 .RI [ options ]
@@ -34,18 +38,24 @@ Create and configure a toolbox container the usual way
 .IR "toolbox run" ).
 .IP 2.
 Run
-.B schupfn enter
-to export the container's filesystem to a qcow2 disk image, boot it
-as a VM with the host kernel, and SSH in.
+.B schupfn create
+to export the container's filesystem to a qcow2 disk image.
 .IP 3.
+Run
+.B schupfn enter
+to boot the image as a VM with the host kernel and SSH in.
+.IP 4.
 Work inside the VM as you would inside
 .BR toolbox (1).
 When you exit, the VM shuts down.
 .SH COMMANDS
-.SS enter \fR[\fIname\fR] [\fIoptions\fR]
+.SS create \fR[\fIname\fR] [\fIoptions\fR]
 Export the toolbox container
 .I name
-to a qcow2 disk image and boot it as a VM.
+to a qcow2 disk image.
+The image is cached and reused by
+.B schupfn enter
+until the container changes.
 If
 .I name
 is omitted, the
@@ -60,6 +70,43 @@ The container must have these packages installed:
 If any are missing,
 .B schupfn
 will offer to install them.
+.PP
+The options are as follows:
+.TP
+.B \-\-refresh
+Force re\-export of the disk image, even if the cached copy appears fresh.
+.TP
+.B \-\-deep\-check
+Use
+.B podman diff
+for more thorough staleness detection when deciding whether to
+re\-export.
+.TP
+.BI \-\-image\-size " size"
+Size of the qcow2 disk image, e.g.\&
+.BR 4G ,
+.BR 10G .
+If not specified, the image is auto\-sized from the container
+(tarball size + 50% headroom, minimum 2G).
+.TP
+.BI \-\-config " path"
+Load the configuration file from
+.I path
+instead of searching for
+.B .schupfn/config.yml
+in parent directories.
+It is an error if the file does not exist.
+.SS enter \fR[\fIname\fR] [\fIoptions\fR]
+Boot a previously created VM image and connect to it via SSH.
+The image must already exist; run
+.B schupfn create
+first to export the container to a disk image.
+If
+.I name
+is omitted, the
+.B container
+field from the configuration file is used (see
+.BR "CONFIGURATION FILE" ).
 .PP
 The options are as follows:
 .TP
@@ -107,22 +154,6 @@ instead of searching for
 .B .schupfn/config.yml
 in parent directories.
 It is an error if the file does not exist.
-.TP
-.B \-\-refresh
-Force re\-export of the disk image, even if the cached copy appears fresh.
-.TP
-.B \-\-deep\-check
-Use
-.B podman diff
-for more thorough staleness detection when deciding whether to
-re\-export.
-.TP
-.BI \-\-image\-size " size"
-Size of the qcow2 disk image, e.g.\&
-.BR 4G ,
-.BR 10G .
-If not specified, the image is auto\-sized from the container
-(tarball size + 50% headroom, minimum 2G).
 .TP
 .BI \-\-memory " size"
 Amount of memory for the VM, e.g.\&
@@ -417,7 +448,15 @@ With
 the exit code of the remote command is forwarded as the exit code of
 .BR schupfn .
 .SH EXAMPLES
-Enter a toolbox as a VM:
+Create a VM image from a toolbox container:
+.PP
+.in +4n
+.EX
+schupfn create mybox
+.EE
+.in
+.PP
+Enter the VM:
 .PP
 .in +4n
 .EX
@@ -469,6 +508,7 @@ Use a config file so you only need to type:
 .PP
 .in +4n
 .EX
+schupfn create
 schupfn enter
 .EE
 .in

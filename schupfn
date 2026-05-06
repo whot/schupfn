@@ -751,7 +751,8 @@ Usage: $PROGNAME <command> [options]
 Run toolbox containers in VMs via qemu.
 
 Commands:
-  enter <name>    Export a toolbox container and enter it as a VM
+  create <name>   Export a toolbox container to a VM disk image
+  enter <name>    Boot a VM image and connect via SSH
   join [<name>]   Open a new SSH session to a running VM
   list            Show cached VM images and their freshness status
   clean [<name>]  Remove cached VM images
@@ -764,14 +765,13 @@ usage_enter() {
     cat <<EOF
 Usage: $PROGNAME enter [<name>] [options]
 
-Export the toolbox container <name> to a qcow2 disk image and boot it as
-a VM using qemu. The VM is started in the background and connected to via
-SSH. The current directory is mounted read-write inside the VM.
+Boot a previously created VM image and connect to it via SSH. The current
+directory is mounted read-write inside the VM.
+
+The image must already exist; run '$PROGNAME create <name>' first to
+export the container to a disk image.
 
 If <name> is omitted, the 'container' field from the config file is used.
-
-The container must have these packages installed:
-  openssh-server, systemd-udev, dbus-broker
 
 Options:
   --export-ro <path>  Additional host path to make available in the VM (repeatable)
@@ -782,15 +782,10 @@ Options:
                       the VM via overlayfs (writes go to a tmpfs upper layer
                       and are lost on VM shutdown; the host directory is never
                       modified)
-  --refresh         Force re-export of the image even if it appears fresh
-  --deep-check      Use 'podman diff' for thorough staleness detection
   --memory <size>   VM memory, e.g. 4G, 512M (default: 4G)
   --cpus <n>        VM CPU count (default: host CPU count)
   --command <cmd>   Run <cmd> in the VM instead of an interactive shell
   --config <path>   Use <path> as config file instead of searching for one
-  --image-size <size>
-                    Size of the qcow2 disk image, e.g. 4G, 10G.
-                    Default: auto-sized from container (tarball + 50% headroom)
   --follow-git-worktrees
                     If \$PWD is a git worktree, automatically export the main
                     git directory read-write so git operations work in the VM
@@ -818,12 +813,43 @@ Configuration file:
     export-cow:
       - ~/src/reference-tree
     follow-git-worktrees: true
-    image-size: 10G
     vm:
       memory: 8G
       cpus: 4
       network: false
       display: virtio
+EOF
+}
+
+usage_create() {
+    cat <<EOF
+Usage: $PROGNAME create [<name>] [options]
+
+Export the toolbox container <name> to a qcow2 disk image. The image is
+cached and reused by 'schupfn enter' until the container changes.
+
+If <name> is omitted, the 'container' field from the config file is used.
+
+The container must have these packages installed:
+  openssh-server, systemd-udev, dbus-broker
+
+Options:
+  --refresh         Force re-export of the image even if it appears fresh
+  --deep-check      Use 'podman diff' for thorough staleness detection
+  --image-size <size>
+                    Size of the qcow2 disk image, e.g. 4G, 10G.
+                    Default: auto-sized from container (tarball + 50% headroom)
+  --config <path>   Use <path> as config file instead of searching for one
+  -h, --help        Show this help
+
+Configuration file:
+  schupfn searches from \$PWD upward for .schupfn/config.yml. The first
+  file found is loaded. Use --config to specify an explicit path instead.
+  CLI arguments override config values.
+
+  Example .schupfn/config.yml:
+    container: my-toolbox
+    image-size: 10G
 EOF
 }
 
@@ -1549,12 +1575,129 @@ NETSVC
     info "export complete"
 }
 
+# ── Subcommand: create ──────────────────────────────────────────────────────
+
+cmd_create() {
+    local name=""
+    local refresh=0
+    local deep_check=0
+    local cli_config=""
+    local cli_image_size=""
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help)
+                usage_create
+                exit 0
+                ;;
+            --refresh)
+                refresh=1
+                shift
+                ;;
+            --deep-check)
+                deep_check=1
+                shift
+                ;;
+            --image-size)
+                [ $# -ge 2 ] || die "--image-size requires an argument (e.g. 4G, 10G)"
+                if ! [[ "$2" =~ ^[0-9]+[KMGT]?$ ]]; then
+                    die "invalid --image-size format '$2': expected a number followed by K, M, G, or T (e.g. 4G, 10G, 512M)"
+                fi
+                cli_image_size="$2"
+                shift 2
+                ;;
+            --config)
+                [ $# -ge 2 ] || die "--config requires an argument"
+                cli_config="$2"
+                shift 2
+                ;;
+            -*)
+                die "unknown option: $1"
+                ;;
+            *)
+                if [ -z "$name" ]; then
+                    name="$1"
+                else
+                    die "unexpected argument: $1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    # Load configuration file (if any). --config overrides the default
+    # search; otherwise walk from $PWD upward for .schupfn/config.yml,
+    # falling back to $XDG_CONFIG_HOME/schupfn/<name>-config.yml (if the
+    # container name is known from the CLI), then default-config.yml.
+    # Config values provide defaults; CLI arguments always take precedence.
+    local -a _cfg_exports=()
+    local -a _cfg_exports_rw=()
+    local -a _cfg_exports_cow=()
+    local _cfg_container="" _cfg_command="" _cfg_memory="" _cfg_cpus="" _cfg_network="" _cfg_display="" _cfg_image_size="" _cfg_follow_git_worktrees=""
+    local config_file
+    if [ -n "$cli_config" ]; then
+        if [ ! -f "$cli_config" ]; then
+            die "config file not found: $cli_config"
+        fi
+        config_file="$cli_config"
+        info "using config: $config_file"
+        load_config "$config_file"
+    elif config_file=$(find_config_file "$PWD" "$name"); then
+        info "using config: $config_file"
+        load_config "$config_file"
+    fi
+
+    # Container name: CLI wins, then config
+    if [ -z "$name" ]; then
+        name="${_cfg_container}"
+    fi
+    if [ -z "$name" ]; then
+        die "container name required. See '$PROGNAME create --help'."
+    fi
+
+    validate_container_name "$name"
+
+    local image_size="${cli_image_size:-${_cfg_image_size}}"
+
+    check_prerequisites
+
+    # Verify the container exists
+    if ! podman container inspect "$name" >/dev/null 2>&1; then
+        die "container '$name' does not exist. Create it with 'toolbox create $name'."
+    fi
+
+    # Check that the container has required packages installed
+    check_container_prerequisites "$name"
+
+    local cache_dir="$CACHE_DIR/$name"
+
+    # Check freshness (unless --refresh forces re-export)
+    local need_export=0
+    if [ "$refresh" = "1" ]; then
+        info "forced refresh requested"
+        need_export=1
+    elif ! check_freshness "$name" "$cache_dir" "$deep_check"; then
+        need_export=1
+    else
+        info "image for '$name' is up to date"
+    fi
+
+    if [ "$need_export" = "1" ]; then
+        export_image "$name" "$cache_dir" "$image_size"
+    fi
+
+    local image="$cache_dir/$name.qcow2"
+    if [ ! -f "$image" ]; then
+        die "disk image not found at $image"
+    fi
+
+    info "image ready: $image"
+}
+
 # ── Subcommand: enter ───────────────────────────────────────────────────────
 
 cmd_enter() {
     local name=""
-    local refresh=0
-    local deep_check=0
     local memory=""
     local cpus=""
     local network=""
@@ -1565,7 +1708,7 @@ cmd_enter() {
     local -a exports=()
     local -a exports_rw=()
     local -a exports_cow=()
-    local cli_memory="" cli_cpus="" cli_network="" cli_display="" cli_image_size=""
+    local cli_memory="" cli_cpus="" cli_network="" cli_display=""
     local follow_git_worktrees=0
 
     while [ $# -gt 0 ]; do
@@ -1591,14 +1734,6 @@ cmd_enter() {
                 ;;
             --dotfile)
                 die "--dotfile has been removed; use --export-ro instead"
-                ;;
-            --refresh)
-                refresh=1
-                shift
-                ;;
-            --deep-check)
-                deep_check=1
-                shift
                 ;;
             --memory)
                 [ $# -ge 2 ] || die "--memory requires an argument"
@@ -1632,14 +1767,6 @@ cmd_enter() {
             --verbose)
                 verbose=1
                 shift
-                ;;
-            --image-size)
-                [ $# -ge 2 ] || die "--image-size requires an argument (e.g. 4G, 10G)"
-                if ! [[ "$2" =~ ^[0-9]+[KMGT]?$ ]]; then
-                    die "invalid --image-size format '$2': expected a number followed by K, M, G, or T (e.g. 4G, 10G, 512M)"
-                fi
-                cli_image_size="$2"
-                shift 2
                 ;;
             --follow-git-worktrees)
                 follow_git_worktrees=1
@@ -1705,7 +1832,6 @@ cmd_enter() {
     cpus="${cli_cpus:-${_cfg_cpus}}"
     network="${cli_network:-${_cfg_network:-1}}"
     local display="${cli_display:-${_cfg_display}}"
-    local image_size="${cli_image_size:-${_cfg_image_size}}"
     if [ "$follow_git_worktrees" != "1" ] && [ "${_cfg_follow_git_worktrees}" = "1" ]; then
         follow_git_worktrees=1
     fi
@@ -1719,34 +1845,10 @@ cmd_enter() {
 
     check_prerequisites
 
-    # Verify the container exists
-    if ! podman container inspect "$name" >/dev/null 2>&1; then
-        die "container '$name' does not exist. Create it with 'toolbox create $name'."
-    fi
-
-    # Check that the container has required packages installed
-    check_container_prerequisites "$name"
-
     local cache_dir="$CACHE_DIR/$name"
-
-    # Check freshness (unless --refresh forces re-export)
-    local need_export=0
-    if [ "$refresh" = "1" ]; then
-        info "forced refresh requested"
-        need_export=1
-    elif ! check_freshness "$name" "$cache_dir" "$deep_check"; then
-        need_export=1
-    else
-        info "image for '$name' is up to date"
-    fi
-
-    if [ "$need_export" = "1" ]; then
-        export_image "$name" "$cache_dir" "$image_size"
-    fi
-
     local image="$cache_dir/$name.qcow2"
     if [ ! -f "$image" ]; then
-        die "disk image not found at $image"
+        die "no image found for '$name'. Run '$PROGNAME create $name' first."
     fi
 
     # Resolve $PWD to its physical path so the 9p mount uses a real
@@ -1841,7 +1943,7 @@ cmd_enter() {
     # host's crypto-policy or what key types the user has.
     local image_key="$cache_dir/ssh_key"
     if [ ! -f "$image_key" ]; then
-        die "image SSH key not found at $image_key — try --refresh to rebuild the image"
+        die "image SSH key not found at $image_key — try '$PROGNAME create $name --refresh' to rebuild the image"
     fi
 
     local -a key_args=(-i "$image_key")
@@ -2416,6 +2518,9 @@ main() {
     shift
 
     case "$command" in
+        create)
+            cmd_create "$@"
+            ;;
         enter)
             cmd_enter "$@"
             ;;
