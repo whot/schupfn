@@ -145,10 +145,11 @@ EOF
     [ -z "$_cfg_follow_git_worktrees" ]
 }
 
-@test "load_config: parses image-size" {
+@test "load_config: parses image.size" {
     yq_or_skip
     cat > "$TMPDIR/config.yml" <<'EOF'
-image-size: 10G
+image:
+  size: 10G
 EOF
     load_config "$TMPDIR/config.yml"
     [ "$_cfg_image_size" = "10G" ]
@@ -223,7 +224,8 @@ export-rw:
 export-cow:
   - /tmp/cow1
 follow-git-worktrees: true
-image-size: 10G
+image:
+  size: 10G
 vm:
   memory: 16G
   cpus: 8
@@ -292,7 +294,8 @@ export-rw:
 export-cow:
   - /tmp/ccc
 follow-git-worktrees: true
-image-size: 10G
+image:
+  size: 10G
 vm:
   memory: 4G
   cpus: 2

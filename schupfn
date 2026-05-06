@@ -635,7 +635,7 @@ find_config_file() {
 #   _cfg_cpus       - VM CPU count, empty if not set
 #   _cfg_network    - "0" if network: false, empty if not set
 #   _cfg_display    - VM display adapter type, empty if not set
-#   _cfg_image_size - disk image size, empty if not set
+#   _cfg_image_size - disk image size (from image.size), empty if not set
 #   _cfg_follow_git_worktrees - "1" if follow-git-worktrees: true, empty if not set
 load_config() {
     local config_file="$1"
@@ -667,7 +667,7 @@ load_config() {
         "cpus="      + ((.vm.cpus // "") | tostring),
         "network="   + (.vm.network | tostring),
         "display="   + (.vm.display // ""),
-        "image_size=" + (.["image-size"] // ""),
+        "image_size=" + (.image.size // ""),
         "follow_git_worktrees=" + (.["follow-git-worktrees"] | tostring),
         "__EXPORT_RO__",
         (.["export-ro"] // [] | .[]),
@@ -723,7 +723,7 @@ load_config() {
                 ;;
             __KEYS__)
                 [ -z "$line" ] && continue
-                local _known_keys=" container command export-ro export-rw export-cow follow-git-worktrees image-size vm vm.memory vm.cpus vm.network vm.display "
+                local _known_keys=" container command export-ro export-rw export-cow follow-git-worktrees image image.size vm vm.memory vm.cpus vm.network vm.display "
                 if [[ "$_known_keys" != *" $line "* ]]; then
                     warn "unknown config key '$line' in $config_file"
                 fi
@@ -849,7 +849,8 @@ Configuration file:
 
   Example .schupfn/config.yml:
     container: my-toolbox
-    image-size: 10G
+    image:
+      size: 10G
 EOF
 }
 
