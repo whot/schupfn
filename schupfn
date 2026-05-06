@@ -222,7 +222,7 @@ check_container_prerequisites() {
     case "$answer" in
         y|Y|yes|YES)
             info "installing ${missing[*]} in container '$name'..."
-            if ! toolbox run -c "$name" sudo dnf install -y "${missing[@]}"; then
+            if ! toolbox run -c "$name" sudo dnf -q install -y "${missing[@]}"; then
                 die "failed to install packages"
             fi
             info "packages installed"
