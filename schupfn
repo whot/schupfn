@@ -230,10 +230,12 @@ check_container_prerequisites() {
     case "$answer" in
         y|Y|yes|YES)
             todo "installing ${missing[*]} in container '$name'..."
-            if ! toolbox run -c "$name" sudo dnf -q install -y "${missing[@]}"; then
-                die "failed to install packages"
+            dnf_msgs=$(mktemp)
+            trap 'rm -f "$dnf_msgs"' RETURN
+            if ! toolbox run -c "$name" sudo dnf -q install -y "${missing[@]}" >/dev/null 2>"$dnf_msgs"; then
+                die "failed to install packages: $(cat "$dnf_msgs")"
             fi
-            todo_done "packages installed"
+            todo_done
             ;;
         *)
             die "cannot continue without: ${missing[*]}"
@@ -1539,6 +1541,19 @@ export_image() {
         rm -f "$tmp"
     }
 
+    # Helper: run dnf install inside the container, showing any error
+    # messages on failure.
+    _bdnf() {
+        local msgs
+        msgs=$(mktemp)
+        trap 'rm -f "$msgs"' RETURN
+        if ! _brun dnf -q install -y "$@" >/dev/null 2>"$msgs"; then
+            local err
+            err=$(cat "$msgs")
+            die "failed to install packages: $*: $err"
+        fi
+    }
+
     # ── Container-to-VM transition fixes ────────────────────────────────
 
     _brun rm -f /.dockerenv
@@ -1645,10 +1660,7 @@ SSHD_SVC
 
     if [ ${#packages[@]} -gt 0 ]; then
         todo "installing extra packages: ${packages[*]}"
-        dnf_msgs=$(mktemp)
-        trap 'rm -f "$dnf_msgs"' RETURN
-        _brun bash -c "dnf -q install -y ${packages[*]} >/dev/null 2>$dnf_msgs" \
-            || die "failed to install packages: ${packages[*]}: $(cat "$dnf_msgs")"
+        _bdnf "${packages[@]}"
         todo_done
     fi
 
