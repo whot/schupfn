@@ -230,15 +230,15 @@ wait_for_ssh() {
 
     todo "waiting for VM to boot..."
 
-    local port_reached=0
-
     # Initial delay: qemu's SLIRP stack accepts TCP connections on the
     # hostfwd port immediately (before the guest has networking), but
     # can't forward data until the guest's virtio-net is up.  Early
     # connections get stuck in SLIRP's backlog and never complete the
-    # SSH handshake.  Wait a few seconds for the guest to boot first.
-    sleep 3
-    elapsed=3
+    # SSH handshake.  A too-short delay causes spurious connections
+    # that trigger OpenSSH's per-source penalty system, making
+    # subsequent attempts even slower.
+    sleep 5
+    elapsed=5
 
     while [ "$elapsed" -lt "$timeout" ]; do
         # Check that the background VM process is still alive
@@ -249,15 +249,6 @@ wait_for_ssh() {
                 sed 's/^/  /' "$QEMU_LOG" >&2
             fi
             die "VM process exited before SSH became available"
-        fi
-
-        # First check: is the port even reachable? (TCP connect)
-        if [ "$port_reached" = "0" ]; then
-            if bash -c "echo >/dev/tcp/127.0.0.1/$port" 2>/dev/null; then
-                port_reached=1
-                todo_done # that's the 'waiting for vm to boot'
-                todo "SSH port is open, testing authentication..."
-            fi
         fi
 
         if ssh -4 -F /dev/null \
@@ -282,24 +273,19 @@ wait_for_ssh() {
         elapsed=$((elapsed + 1))
     done
 
-    # Provide a more specific error message
-    if [ "$port_reached" = "0" ]; then
-        die "timed out waiting for SSH (${timeout}s). Port $port never became reachable — sshd may not have started in the VM."
-    else
-        # Port was open but authentication failed — show SSH debug output
-        warn "SSH port is reachable but authentication failed. Debug output:"
-        ssh -4 -F /dev/null -v -o BatchMode=yes \
-            -o ConnectTimeout=5 \
-            -o StrictHostKeyChecking=no \
-            -o UserKnownHostsFile=/dev/null \
-            -o IdentitiesOnly=yes \
-            -o ControlPath=none \
-            -o PubkeyAcceptedAlgorithms=+ssh-rsa \
-            "${key_flags[@]}" \
-            -p "$port" \
-            127.0.0.1 true 2>&1 | sed 's/^/  /' >&2
-        die "timed out waiting for SSH (${timeout}s). Port is open but sshd not responding (banner exchange timeout). Keys: ${keys[*]}"
-    fi
+    # Show SSH debug output to help diagnose the failure
+    warn "SSH connection failed. Debug output:"
+    ssh -4 -F /dev/null -v -o BatchMode=yes \
+        -o ConnectTimeout=5 \
+        -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null \
+        -o IdentitiesOnly=yes \
+        -o ControlPath=none \
+        -o PubkeyAcceptedAlgorithms=+ssh-rsa \
+        "${key_flags[@]}" \
+        -p "$port" \
+        127.0.0.1 true 2>&1 | sed 's/^/  /' >&2
+    die "timed out waiting for SSH (${timeout}s). Keys: ${keys[*]}"
 }
 
 # Collect all PIDs in the process tree rooted at $1 (depth-first).
@@ -1593,6 +1579,7 @@ UseDNS no
 GSSAPIAuthentication no
 X11Forwarding no
 PrintMotd no
+PerSourcePenaltyExemptList 10.0.2.2
 AcceptEnv LANG LC_*
 Subsystem sftp /usr/libexec/openssh/sftp-server
 SSHD_CONF
@@ -1740,9 +1727,10 @@ NETSVC
     # directly (avoids "Device or resource busy" on /etc/hostname)
     buildah config --hostname "$name" "$wc" >/dev/null 2>&1 || true
 
+    todo_done
+
     # ── Export ──────────────────────────────────────────────────────────
 
-    todo_done
     todo "exporting prepared container..."
     local prepared_image="localhost/schupfn-prepared-$name"
     if ! buildah commit --rm --squash "$wc" "$prepared_image" >/dev/null 2>&1; then
