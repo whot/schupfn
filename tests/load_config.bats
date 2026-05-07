@@ -19,6 +19,7 @@ setup() {
     _cfg_display=""
     _cfg_follow_git_worktrees=""
     _cfg_image_size=""
+    _cfg_packages=()
 }
 
 teardown() {
@@ -155,6 +156,22 @@ EOF
     [ "$_cfg_image_size" = "10G" ]
 }
 
+@test "load_config: parses image.install-packages" {
+    yq_or_skip
+    cat > "$TMPDIR/config.yml" <<'EOF'
+image:
+  install-packages:
+    - zsh
+    - vim
+    - htop
+EOF
+    load_config "$TMPDIR/config.yml"
+    [ "${#_cfg_packages[@]}" -eq 3 ]
+    [ "${_cfg_packages[0]}" = "zsh" ]
+    [ "${_cfg_packages[1]}" = "vim" ]
+    [ "${_cfg_packages[2]}" = "htop" ]
+}
+
 @test "load_config: parses vm.display" {
     yq_or_skip
     cat > "$TMPDIR/config.yml" <<'EOF'
@@ -226,6 +243,9 @@ export-cow:
 follow-git-worktrees: true
 image:
   size: 10G
+  install-packages:
+    - zsh
+    - vim
 vm:
   memory: 16G
   cpus: 8
@@ -243,6 +263,9 @@ EOF
     [ "${_cfg_exports_cow[0]}" = "/tmp/cow1" ]
     [ "$_cfg_follow_git_worktrees" = "1" ]
     [ "$_cfg_image_size" = "10G" ]
+    [ "${#_cfg_packages[@]}" -eq 2 ]
+    [ "${_cfg_packages[0]}" = "zsh" ]
+    [ "${_cfg_packages[1]}" = "vim" ]
     [ "$_cfg_memory" = "16G" ]
     [ "$_cfg_cpus" = "8" ]
     [ "$_cfg_network" = "0" ]
@@ -296,6 +319,8 @@ export-cow:
 follow-git-worktrees: true
 image:
   size: 10G
+  install-packages:
+    - zsh
 vm:
   memory: 4G
   cpus: 2

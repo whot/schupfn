@@ -87,6 +87,16 @@ Size of the qcow2 disk image, e.g.\&
 If not specified, the image is auto\-sized from the container
 (tarball size + 50% headroom, minimum 2G).
 .TP
+.BI \-\-install\-packages " pkg"
+Install additional packages in the image via
+.BR dnf (8).
+This option may be given multiple times.
+Packages are installed before the image is finalized, so they are
+available immediately when the VM boots. Typically all required packages
+should be in the toolbox container, this option should only
+be used for packages that are required in the VM but are not supposed
+to be in the toolbox.
+.TP
 .BI \-\-config " path"
 Load the configuration file from
 .I path
@@ -311,6 +321,13 @@ Size of the qcow2 disk image, e.g.\&
 .BR 10G .
 Same as
 .BR \-\-image\-size .
+.TP
+.B image.install\-packages
+.RI ( "list of strings" )
+Packages to install in the image via
+.BR dnf (8).
+Same as
+.BR \-\-install\-packages .
 .TP
 .B vm.memory
 .RI ( string )
