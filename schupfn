@@ -1664,6 +1664,10 @@ SSHD_SVC
 
     _brun chmod 700 "${homedir}/.ssh"
 
+    # Passwordless sudo: add user to wheel and enable NOPASSWD for wheel
+    _brun bash -c "usermod -aG wheel ${username} 2>/dev/null || (grep -q '^wheel:' /etc/group && sed -i 's/^wheel:x:\([0-9]*\):.*/&,${username}/' /etc/group)"
+    _brun bash -c "sed -i 's/^# *%wheel.*NOPASSWD.*ALL$/%wheel ALL=(ALL) NOPASSWD: ALL/' /etc/sudoers 2>/dev/null || true"
+
     # ── 9p mount script + service ───────────────────────────────────────
 
     local mount_script_tmp mount_service_tmp
