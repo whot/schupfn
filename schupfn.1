@@ -10,6 +10,13 @@ schupfn \- run toolbox containers in virtual machines
 .RI [ name ]
 .RI [ options ]
 .br
+.B schupfn start
+.RI [ name ]
+.RI [ options ]
+.br
+.B schupfn stop
+.RI [ name ]
+.br
 .B schupfn join
 .RI [ name ]
 .RI [ options ]
@@ -201,6 +208,43 @@ Use Ctrl\-A X to quit the VM.
 .TP
 .B \-\-verbose
 Show VM boot output on stderr.
+.SS start \fR[\fIname\fR] [\fIoptions\fR]
+Start a VM in the background from a previously created image.
+The VM keeps running until explicitly stopped with
+.BR "schupfn stop" .
+Use
+.B schupfn join
+to connect to the running VM.
+.PP
+The image must already exist; run
+.B schupfn create
+first.
+If
+.I name
+is omitted, the
+.B container
+field from the configuration file is used.
+.PP
+The options are the same as for
+.B enter
+except that
+.B \-\-command
+and
+.B \-\-console
+are not available.
+.SS stop \fR[\fIname\fR]
+Shut down a running VM that was started with
+.BR "schupfn start" .
+If
+.I name
+is omitted and exactly one VM is running, that VM is stopped
+automatically.
+If multiple VMs are running, an interactive menu is presented.
+.PP
+If there are active
+.B join
+sessions, the command waits for them to disconnect before
+shutting down the VM.
 .SS join \fR[\fIname\fR] [\fIoptions\fR]
 Open a new SSH session to an already\-running VM.
 This allows multiple terminal sessions to share the same VM
@@ -484,6 +528,16 @@ Run a single command and exit:
 .in +4n
 .EX
 schupfn enter mybox \-\-command "make -j$(nproc) test"
+.EE
+.in
+.PP
+Start a VM in the background and connect later:
+.PP
+.in +4n
+.EX
+schupfn start mybox
+schupfn join mybox
+schupfn stop mybox
 .EE
 .in
 .PP

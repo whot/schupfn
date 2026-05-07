@@ -423,6 +423,296 @@ cleanup_vm() {
     fi
 }
 
+# Boot a VM in the background, wait for SSH, and set up the guest.
+#
+# This function operates on variables in the caller's scope.
+#
+# Expected variables (set by caller):
+#   name            - container/image name
+#   cache_dir       - cache directory for the image
+#   image           - path to the base qcow2 image
+#   memory          - VM memory (e.g. "4G")
+#   cpus            - VM CPU count (may be empty for host default)
+#   network         - "1" for full network, "0" for restricted
+#   display         - VGA display type (empty for none)
+#   verbose         - "1" to tail serial log during boot
+#   console         - "1" for serial console mode (runs foreground, exits)
+#   rw_mount_dirs   - array of directories to mount read-write
+#   ro_mount_dirs   - array of directories to mount read-only
+#   cow_mount_dirs  - array of directories to mount copy-on-write
+#   rootfs_symlinks - array of "link:target" pairs to create in guest
+#   dotfiles        - array of file paths to copy into guest
+#
+# Variables set in caller's scope on return:
+#   QEMU_PID        - (global) PID of the background qemu process
+#   SESSION_NAME    - (global) name, for cleanup_vm
+#   ssh_port        - SSH port on localhost
+#   session_image   - path to the session snapshot (caller must clean up)
+#   serial_log      - path to the serial log (caller must clean up)
+#   ssh_opts        - array of SSH options for connecting to the VM
+#
+# Does NOT set EXIT traps — the caller decides on cleanup behavior.
+_boot_vm() {
+    # Find the host kernel and initramfs
+    local kernel initramfs
+    kernel=$(find_host_kernel)
+    initramfs=$(find_host_initramfs)
+    info "using kernel: $kernel"
+    if [ -n "$initramfs" ]; then
+        info "using initramfs: $initramfs"
+    else
+        info "no readable initramfs found (booting without one)"
+    fi
+
+    # Pick a port for SSH
+    ssh_port=$(find_free_port)
+
+    # Use the image's dedicated SSH key for connecting.
+    local image_key="$cache_dir/ssh_key"
+    if [ ! -f "$image_key" ]; then
+        die "image SSH key not found at $image_key — try '$PROGNAME create $name --force' to rebuild the image"
+    fi
+
+    local -a key_args=(-i "$image_key")
+
+    # Create a snapshot of the image for this session so the base image
+    # stays clean. Each boot gets its own copy-on-write layer.
+    local abs_image
+    abs_image="$(realpath "$image")"
+    session_image="$cache_dir/$name-session-$$.qcow2"
+    if ! qemu-img create -f qcow2 -b "$abs_image" -F qcow2 "$session_image" >/dev/null 2>&1; then
+        die "failed to create session snapshot"
+    fi
+
+    local username
+    username=$(whoami)
+
+    # Build the kernel command line.
+    #
+    # enforcing=0: set SELinux to permissive at boot. The container
+    #   image has SELinux labels from the container context that are
+    #   wrong for a VM. Permissive mode prevents denials from blocking
+    #   services like sshd, dbus, and mount operations.
+    # systemd.condition-needs-update=: suppress "System Needs Update"
+    #   checks that can cause unnecessary firstboot-like behavior.
+    local -a kernel_args=(
+        "root=/dev/vda"
+        "rw"
+        "console=ttyS0,115200"
+        "init=/sbin/init"
+        "enforcing=0"
+        "idle=halt"
+        "systemd.condition-needs-update="
+        "schupfn.container=$name"
+        "schupfn.chdir=$PWD"
+        "schupfn.user=$username"
+        "schupfn.home=$HOME"
+    )
+
+    if [ "$verbose" != "1" ]; then
+        kernel_args+=("quiet")
+    fi
+
+    # Build qemu command.
+    #
+    # -no-reboot: exit on guest reboot/crash instead of looping
+    local -a qemu_cmd=(
+        qemu-system-x86_64
+        -enable-kvm
+        -cpu host
+        -m "$memory"
+        -no-reboot
+        -kernel "$kernel"
+        -drive "file=$session_image,format=qcow2,if=virtio"
+    )
+
+    if [ -n "$initramfs" ]; then
+        qemu_cmd+=(-initrd "$initramfs")
+    fi
+
+    # Display adapter
+    if [ -n "$display" ]; then
+        case "$display" in
+            virtio|qxl|std|none|cirrus|vmware) ;;
+            *) die "invalid --display type: '$display' (must be one of: virtio, qxl, std, none, cirrus, vmware)" ;;
+        esac
+        qemu_cmd+=(-vga "$display")
+    else
+        qemu_cmd+=(-display none -vga none)
+    fi
+
+    # Serial console setup
+    serial_log="$cache_dir/serial-$$.log"
+    if [ "${console:-0}" = "1" ]; then
+        qemu_cmd+=(-nographic)
+    else
+        qemu_cmd+=(-serial "file:$serial_log" -monitor none)
+    fi
+
+    if [ -n "$cpus" ]; then
+        qemu_cmd+=(-smp "$cpus")
+    fi
+
+    # Networking: user-mode (SLIRP) with SSH port forwarding.
+    if [ "$network" = "1" ]; then
+        qemu_cmd+=(
+            -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:${ssh_port}-:22"
+            -device "virtio-net-pci,netdev=net0"
+        )
+    else
+        qemu_cmd+=(
+            -netdev "user,id=net0,restrict=on,hostfwd=tcp:127.0.0.1:${ssh_port}-:22"
+            -device "virtio-net-pci,netdev=net0"
+        )
+    fi
+
+    # Mount directories into the VM via 9p at their original paths.
+    local fs_idx=0
+    for dir in "${rw_mount_dirs[@]}"; do
+        local tag="schupfn_rw_${fs_idx}"
+        todo "exporting directory (rw): $dir"
+        qemu_cmd+=(-virtfs "local,path=$dir,mount_tag=$tag,security_model=none,id=fs${fs_idx}")
+        kernel_args+=("schupfn.9p=${tag}:${dir}:rw")
+        fs_idx=$((fs_idx + 1))
+        todo_done
+    done
+
+    for dir in "${ro_mount_dirs[@]}"; do
+        local tag="schupfn_ro_${fs_idx}"
+        todo "exporting directory (ro): $dir"
+        qemu_cmd+=(-virtfs "local,path=$dir,mount_tag=$tag,security_model=none,id=fs${fs_idx},readonly=on")
+        kernel_args+=("schupfn.9p=${tag}:${dir}:ro")
+        fs_idx=$((fs_idx + 1))
+        todo_done
+    done
+
+    for dir in "${cow_mount_dirs[@]}"; do
+        local tag="schupfn_cow_${fs_idx}"
+        todo "exporting directory (cow): $dir"
+        qemu_cmd+=(-virtfs "local,path=$dir,mount_tag=$tag,security_model=none,id=fs${fs_idx},readonly=on")
+        kernel_args+=("schupfn.9p=${tag}:${dir}:cow")
+        fs_idx=$((fs_idx + 1))
+        todo_done
+    done
+
+    # Mount host kernel modules so the VM can load them
+    local kver
+    kver=$(uname -r)
+    if [ -d "/lib/modules/$kver" ]; then
+        local tag="schupfn_kmod"
+        qemu_cmd+=(-virtfs "local,path=/lib/modules/$kver,mount_tag=$tag,security_model=none,id=fskmod,readonly=on")
+        kernel_args+=("schupfn.9p=${tag}:/lib/modules/${kver}:ro")
+    fi
+
+    # Assemble kernel command line
+    local kernel_cmdline=""
+    for arg in "${kernel_args[@]}"; do
+        kernel_cmdline+="$arg "
+    done
+    qemu_cmd+=(-append "$kernel_cmdline")
+
+    # ── Console mode: run qemu in the foreground with serial on stdio ──
+    if [ "${console:-0}" = "1" ]; then
+        info "starting VM '$name' in console mode (Ctrl-A X to quit)..."
+        "${qemu_cmd[@]}"
+        exit 0
+    fi
+
+    # Start qemu in the background
+    todo "starting VM '$name' (ssh port $ssh_port)..."
+
+    local qemu_log="$cache_dir/qemu.log"
+    QEMU_LOG="$qemu_log"
+    : > "$serial_log"  # truncate/create so tail -f doesn't fail
+    "${qemu_cmd[@]}" </dev/null >"$qemu_log" 2>&1 &
+    QEMU_PID=$!
+    SESSION_NAME="$name"
+
+    # In verbose mode, tail the serial console log on stderr so the
+    # user can see boot progress.  Kill the tail once SSH is up.
+    local tail_pid=""
+    if [ "$verbose" = "1" ]; then
+        tail -f "$serial_log" >&2 &
+        tail_pid=$!
+    fi
+
+    todo_done
+
+    # Wait for SSH to become available
+    wait_for_ssh "$ssh_port" "$image_key"
+
+    # Stop tailing serial log
+    if [ -n "$tail_pid" ]; then
+        kill "$tail_pid" 2>/dev/null
+        wait "$tail_pid" 2>/dev/null
+    fi
+
+    todo "VM is up, registering session"
+    # Register this VM session so 'schupfn join' and 'schupfn stop' can find it
+    write_session "$name" "$QEMU_PID" "$ssh_port" "$PWD" "$image_key" "$session_image" "$serial_log"
+    todo_done
+
+    # Build SSH options for the caller
+    ssh_opts=(
+        -4
+        -F /dev/null
+        -o StrictHostKeyChecking=no
+        -o UserKnownHostsFile=/dev/null
+        -o IdentitiesOnly=yes
+        -o PubkeyAcceptedAlgorithms=+ssh-rsa
+        -o LogLevel=ERROR
+        "${key_args[@]}"
+        -p "$ssh_port"
+    )
+
+    # Quick sanity test: verify authentication works
+    if ! ssh "${ssh_opts[@]}" \
+            -o BatchMode=yes \
+            -l "$username" \
+            127.0.0.1 "echo schupfn-auth-ok" 2>/dev/null | grep -q "schupfn-auth-ok"; then
+        warn "SSH authentication test failed. Trying with verbose output..."
+        ssh -v "${ssh_opts[@]}" \
+            -o BatchMode=yes \
+            -l "$username" \
+            127.0.0.1 "echo schupfn-auth-ok" 2>&1 >&2
+        die "SSH authentication failed for user '$username'"
+    fi
+
+    # Create symlinks inside the VM for any symlinked export paths.
+    if [ ${#rootfs_symlinks[@]} -gt 0 ]; then
+        local symlink_script=""
+        for entry in "${rootfs_symlinks[@]}"; do
+            local link_path="${entry%%:*}"
+            local target="${entry#*:}"
+            todo "creating symlink: $link_path -> $target"
+            local escaped_dir escaped_link escaped_target
+            todo_done
+            escaped_dir=$(printf '%q' "$(dirname "$link_path")")
+            escaped_link=$(printf '%q' "$link_path")
+            escaped_target=$(printf '%q' "$target")
+            symlink_script+="mkdir -p $escaped_dir && "
+            symlink_script+="[ -e $escaped_link ] || ln -s $escaped_target $escaped_link; "
+        done
+        ssh "${ssh_opts[@]}" -l root 127.0.0.1 "$symlink_script" 2>/dev/null \
+            || warn "failed to create symlinks in VM"
+    fi
+
+    # Copy exported files into the VM at their original absolute paths.
+    if [ ${#dotfiles[@]} -gt 0 ]; then
+        local -a tar_paths=()
+        for df in "${dotfiles[@]}"; do
+            todo "copying file: $df"
+            tar_paths+=("${df#/}")
+            todo_done
+        done
+
+        tar -chf - -C / "${tar_paths[@]}" | \
+            ssh "${ssh_opts[@]}" -l root 127.0.0.1 \
+                "tar -xf - -C /" 2>/dev/null \
+        || warn "failed to copy exported files"
+    fi
+}
+
 # ── Session management ──────────────────────────────────────────────────────
 
 # Write a session file for a running VM so other processes can join it.
@@ -439,6 +729,8 @@ write_session() {
     local ssh_port="$3"
     local workdir="$4"
     local ssh_key="${5:-}"
+    local session_image="${6:-}"
+    local serial_log="${7:-}"
 
     mkdir -p -m 0700 "$SESSION_DIR"
 
@@ -448,6 +740,8 @@ pid=$pid
 ssh_port=$ssh_port
 workdir=$workdir
 ssh_key=$ssh_key
+session_image=$session_image
+serial_log=$serial_log
 started_at=$(date -Iseconds)
 EOF
 }
@@ -483,10 +777,12 @@ cleanup_stale_sessions() {
         [ -f "$session_file" ] || continue
         local pid
         pid=$(read_session "$session_file" "pid")
-        if [ -z "$pid" ] || ! [[ "$pid" =~ ^[0-9]+$ ]]; then
-            # Missing or non-numeric pid — corrupt session file
-            rm -f "$session_file"
-        elif ! kill -0 "$pid" 2>/dev/null; then
+        if [ -z "$pid" ] || ! [[ "$pid" =~ ^[0-9]+$ ]] || ! kill -0 "$pid" 2>/dev/null; then
+            local si sl
+            si=$(read_session "$session_file" "session_image")
+            sl=$(read_session "$session_file" "serial_log")
+            [ -n "$si" ] && rm -f "$si"
+            [ -n "$sl" ] && rm -f "$sl"
             rm -f "$session_file"
         fi
     done
@@ -771,6 +1067,8 @@ Run toolbox containers in VMs via qemu.
 Commands:
   create <name>   Export a toolbox container to a VM disk image
   enter <name>    Boot a VM image and connect via SSH
+  start <name>    Start a VM in the background
+  stop [<name>]   Shut down a running VM
   join [<name>]   Open a new SSH session to a running VM
   list            Show cached VM images and their freshness status
   clean [<name>]  Remove cached VM images
@@ -878,6 +1176,60 @@ Configuration file:
       install-packages:
         - zsh
         - vim
+EOF
+}
+
+usage_start() {
+    cat <<EOF
+Usage: $PROGNAME start [<name>] [options]
+
+Start a VM in the background from a previously created image. The VM
+keeps running until explicitly stopped with '$PROGNAME stop'.
+
+Use '$PROGNAME join' to connect to the running VM.
+
+The image must already exist; run '$PROGNAME create <name>' first to
+export the container to a disk image.
+
+If <name> is omitted, the 'container' field from the config file is used.
+
+Options:
+  --export-ro <path>  Additional host path to make available in the VM (repeatable)
+                      Directories are mounted read-only at their original path.
+                      Files are copied into the VM at their original path.
+  --export-rw <path>  Like --export-ro, but directories are mounted read-write
+  --export-cow <path> Like --export-ro, but the directory is writable inside
+                      the VM via overlayfs (writes go to a tmpfs upper layer
+                      and are lost on VM shutdown; the host directory is never
+                      modified)
+  --memory <size>   VM memory, e.g. 4G, 512M (default: 4G)
+  --cpus <n>        VM CPU count (default: host CPU count)
+  --config <path>   Use <path> as config file instead of searching for one
+  --follow-git-worktrees
+                    If \$PWD is a git worktree, automatically export the main
+                    git directory read-write so git operations work in the VM
+  --no-network      Disable the extra network device (SSH network device remains)
+  --display <type>  Add a display adapter (e.g. virtio, qxl, std) for running
+                    Xorg or Wayland inside the VM
+  --verbose         Show VM boot output
+  -h, --help        Show this help
+EOF
+}
+
+usage_stop() {
+    cat <<EOF
+Usage: $PROGNAME stop [<name>]
+
+Shut down a running VM that was started with '$PROGNAME start'.
+
+If <name> is omitted and exactly one VM is running, that VM is stopped
+automatically. If multiple VMs are running, an interactive menu is shown.
+
+If there are active join sessions, the command waits for them to
+disconnect before shutting down.
+
+Options:
+  -h, --help        Show this help
 EOF
 }
 
@@ -1830,279 +2182,20 @@ cmd_enter() {
 
     check_nested_export_conflicts
 
-    # Find the host kernel and initramfs
-    local kernel initramfs
-    kernel=$(find_host_kernel)
-    initramfs=$(find_host_initramfs)
-    info "using kernel: $kernel"
-    if [ -n "$initramfs" ]; then
-        info "using initramfs: $initramfs"
-    else
-        info "no readable initramfs found (booting without one)"
-    fi
+    # Variables set by _boot_vm in our scope
+    local ssh_port="" session_image="" serial_log=""
+    local -a ssh_opts=()
 
-    # Pick a port for SSH
-    local ssh_port
-    ssh_port=$(find_free_port)
-
-    # Use the image's dedicated SSH key for connecting.  This is an
-    # ed25519 key generated during export_image and baked into the
-    # image's authorized_keys.  It always works regardless of the
-    # host's crypto-policy or what key types the user has.
-    local image_key="$cache_dir/ssh_key"
-    if [ ! -f "$image_key" ]; then
-        die "image SSH key not found at $image_key — try '$PROGNAME create $name --force' to rebuild the image"
-    fi
-
-    local -a key_args=(-i "$image_key")
-
-    # Create a snapshot of the image for this session so the base image
-    # stays clean. Each boot gets its own copy-on-write layer.
-    # The backing file path must be absolute for qemu-img.
-    local abs_image
-    abs_image="$(realpath "$image")"
-    local session_image="$cache_dir/$name-session-$$.qcow2"
-    if ! qemu-img create -f qcow2 -b "$abs_image" -F qcow2 "$session_image" >/dev/null 2>&1; then
-        die "failed to create session snapshot"
-    fi
-
-    local username
-    username=$(whoami)
-
-    # Build the kernel command line.
-    #
-    # enforcing=0: set SELinux to permissive at boot. The container
-    #   image has SELinux labels from the container context that are
-    #   wrong for a VM. Permissive mode prevents denials from blocking
-    #   services like sshd, dbus, and mount operations.
-    # systemd.condition-needs-update=: suppress "System Needs Update"
-    #   checks that can cause unnecessary firstboot-like behavior.
-    local -a kernel_args=(
-        "root=/dev/vda"
-        "rw"
-        "console=ttyS0,115200"
-        "init=/sbin/init"
-        "enforcing=0"
-        "idle=halt"
-        "systemd.condition-needs-update="
-        "schupfn.container=$name"
-        "schupfn.chdir=$PWD"
-        "schupfn.user=$username"
-        "schupfn.home=$HOME"
-    )
-
-    if [ "$verbose" != "1" ]; then
-        kernel_args+=("quiet")
-    fi
-
-    # Build qemu command.
-    #
-    # -no-reboot:     exit on guest reboot/crash instead of looping
-    local -a qemu_cmd=(
-        qemu-system-x86_64
-        -enable-kvm
-        -cpu host
-        -m "$memory"
-        -no-reboot
-        -kernel "$kernel"
-        -drive "file=$session_image,format=qcow2,if=virtio"
-    )
-
-    if [ -n "$initramfs" ]; then
-        qemu_cmd+=(-initrd "$initramfs")
-    fi
-
-    # Display adapter.  When --display is set, add a VGA device and
-    # a GUI window so Xorg/Wayland can run inside the VM.
-    if [ -n "$display" ]; then
-        case "$display" in
-            virtio|qxl|std|none|cirrus|vmware) ;;
-            *) die "invalid --display type: '$display' (must be one of: virtio, qxl, std, none, cirrus, vmware)" ;;
-        esac
-        qemu_cmd+=(-vga "$display")
-    else
-        qemu_cmd+=(-display none -vga none)
-    fi
-
-    # Serial console setup depends on mode:
-    # --console: -nographic (serial on stdio, interactive)
-    # normal:    -serial file:... (log to file, no terminal interaction)
-    local serial_log="$cache_dir/serial.log"
-    if [ "$console" = "1" ]; then
-        qemu_cmd+=(-nographic)
-    else
-        qemu_cmd+=(-serial "file:$serial_log" -monitor none)
-    fi
-
-    if [ -n "$cpus" ]; then
-        qemu_cmd+=(-smp "$cpus")
-    fi
-
-    # Networking: user-mode (SLIRP) with SSH port forwarding.
-    # When the extra network device is enabled, we combine SSH port
-    # forwarding and internet access on a single netdev to avoid
-    # multi-NIC complications with DHCP and routing.
-    if [ "$network" = "1" ]; then
-        qemu_cmd+=(
-            -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:${ssh_port}-:22"
-            -device "virtio-net-pci,netdev=net0"
-        )
-    else
-        qemu_cmd+=(
-            -netdev "user,id=net0,restrict=on,hostfwd=tcp:127.0.0.1:${ssh_port}-:22"
-            -device "virtio-net-pci,netdev=net0"
-        )
-    fi
-
-    # Mount directories into the VM via 9p at their original paths.
-    local fs_idx=0
-    for dir in "${rw_mount_dirs[@]}"; do
-        local tag="schupfn_rw_${fs_idx}"
-        todo "exporting directory (rw): $dir"
-        qemu_cmd+=(-virtfs "local,path=$dir,mount_tag=$tag,security_model=none,id=fs${fs_idx}")
-        kernel_args+=("schupfn.9p=${tag}:${dir}:rw")
-        fs_idx=$((fs_idx + 1))
-        todo_done
-    done
-
-    for dir in "${ro_mount_dirs[@]}"; do
-        local tag="schupfn_ro_${fs_idx}"
-        todo "exporting directory (ro): $dir"
-        qemu_cmd+=(-virtfs "local,path=$dir,mount_tag=$tag,security_model=none,id=fs${fs_idx},readonly=on")
-        kernel_args+=("schupfn.9p=${tag}:${dir}:ro")
-        fs_idx=$((fs_idx + 1))
-        todo_done
-    done
-
-    for dir in "${cow_mount_dirs[@]}"; do
-        local tag="schupfn_cow_${fs_idx}"
-        todo "exporting directory (cow): $dir"
-        qemu_cmd+=(-virtfs "local,path=$dir,mount_tag=$tag,security_model=none,id=fs${fs_idx},readonly=on")
-        kernel_args+=("schupfn.9p=${tag}:${dir}:cow")
-        fs_idx=$((fs_idx + 1))
-        todo_done
-    done
-
-    # Mount host kernel modules so the VM can load them (e.g. virtio_net)
-    local kver
-    kver=$(uname -r)
-    if [ -d "/lib/modules/$kver" ]; then
-        local tag="schupfn_kmod"
-        qemu_cmd+=(-virtfs "local,path=/lib/modules/$kver,mount_tag=$tag,security_model=none,id=fskmod,readonly=on")
-        kernel_args+=("schupfn.9p=${tag}:/lib/modules/${kver}:ro")
-    fi
-
-    # Assemble kernel command line
-    local kernel_cmdline=""
-    for arg in "${kernel_args[@]}"; do
-        kernel_cmdline+="$arg "
-    done
-    qemu_cmd+=(-append "$kernel_cmdline")
-
-    # ── Console mode: run qemu in the foreground with serial on stdio ──
-    if [ "$console" = "1" ]; then
-        info "starting VM '$name' in console mode (Ctrl-A X to quit)..."
-        trap 'rm -f "$session_image"; cleanup_vm' EXIT
-        "${qemu_cmd[@]}"
-        rm -f "$session_image"
-        exit 0
-    fi
-
-    # ── Normal mode: run qemu in the background, connect via SSH ─────
-    todo "starting VM '$name' (ssh port $ssh_port)..."
-
-    # Run qemu in the background.  Serial output goes to a file
-    # (-serial file:...) so there is no monitor on stdin and /dev/null
-    # is safe.  qemu's own stderr (e.g. device errors) goes to a log.
-    local qemu_log="$cache_dir/qemu.log"
-    QEMU_LOG="$qemu_log"
-    : > "$serial_log"  # truncate/create so tail -f doesn't fail
-    "${qemu_cmd[@]}" </dev/null >"$qemu_log" 2>&1 &
-    QEMU_PID=$!
-    SESSION_NAME="$name"
-
-    # Ensure we clean up the VM on exit (Ctrl-C, errors, normal exit)
+    # Ensure we clean up the VM on exit (Ctrl-C, errors, normal exit).
+    # Set before _boot_vm so partial failures are cleaned up too.
     trap 'rm -f "$session_image" "$serial_log"; cleanup_vm' EXIT
 
-    # In verbose mode, tail the serial console log on stderr so the
-    # user can see boot progress.  Kill the tail once SSH is up.
-    local tail_pid=""
-    if [ "$verbose" = "1" ]; then
-        tail -f "$serial_log" >&2 &
-        tail_pid=$!
-    fi
-
-    todo_done
-
-    # Wait for SSH to become available
-    wait_for_ssh "$ssh_port" "$image_key"
-
-    # Stop tailing serial log
-    if [ -n "$tail_pid" ]; then
-        kill "$tail_pid" 2>/dev/null
-        wait "$tail_pid" 2>/dev/null
-    fi
-
-    todo "VM is up, registering session for schupfn join"
-    # Register this VM session so 'schupfn join' can find it
-    # Store the image key in the session file for join to use
-    write_session "$name" "$QEMU_PID" "$ssh_port" "$PWD" "$image_key"
-    todo_done
-
-    # Common SSH options.
-    # -4: force IPv4 (qemu SLIRP hostfwd binds to 127.0.0.1)
-    # -F /dev/null: ignore user's ssh_config entirely to avoid
-    #   ControlMaster, ProxyCommand, or other settings interfering
-    local -a ssh_opts=(
-        -4
-        -F /dev/null
-        -o StrictHostKeyChecking=no
-        -o UserKnownHostsFile=/dev/null
-        -o IdentitiesOnly=yes
-        -o PubkeyAcceptedAlgorithms=+ssh-rsa
-        -o LogLevel=ERROR
-        "${key_args[@]}"
-        -p "$ssh_port"
-    )
-
-    # Create symlinks inside the VM for any symlinked export paths.
-    # The mounts are already ready (sshd waits for schupfn-mounts.service).
-    if [ ${#rootfs_symlinks[@]} -gt 0 ]; then
-        local symlink_script=""
-        for entry in "${rootfs_symlinks[@]}"; do
-            local link_path="${entry%%:*}"
-            local target="${entry#*:}"
-            todo "creating symlink: $link_path -> $target"
-            local escaped_dir escaped_link escaped_target
-            todo_done
-            escaped_dir=$(printf '%q' "$(dirname "$link_path")")
-            escaped_link=$(printf '%q' "$link_path")
-            escaped_target=$(printf '%q' "$target")
-            symlink_script+="mkdir -p $escaped_dir && "
-            symlink_script+="[ -e $escaped_link ] || ln -s $escaped_target $escaped_link; "
-        done
-        ssh "${ssh_opts[@]}" -l root 127.0.0.1 "$symlink_script" 2>/dev/null \
-            || warn "failed to create symlinks in VM"
-    fi
-
-    # Copy exported files into the VM at their original absolute paths.
-    # This runs after the mount wait so $HOME ownership is fixed and
-    # the target directories are writable.
-    if [ ${#dotfiles[@]} -gt 0 ]; then
-        local -a tar_paths=()
-        for df in "${dotfiles[@]}"; do
-            todo "copying file: $df"
-            tar_paths+=("${df#/}")
-            todo_done
-        done
-
-        tar -chf - -C / "${tar_paths[@]}" | \
-            ssh "${ssh_opts[@]}" -l root 127.0.0.1 \
-                "tar -xf - -C /" 2>/dev/null \
-        || warn "failed to copy exported files"
-    fi
+    # Boot the VM (may exit directly in console mode)
+    _boot_vm
 
     # SSH into the VM
+    local username
+    username=$(whoami)
     local quoted_pwd
     printf -v quoted_pwd '%q' "$PWD"
     local remote_cmd
@@ -2126,6 +2219,359 @@ cmd_enter() {
     elif [ $rc -ne 0 ]; then
         warn "SSH session exited with status $rc"
     fi
+}
+
+# ── Subcommand: start ───────────────────────────────────────────────────────
+
+cmd_start() {
+    local name=""
+    local memory=""
+    local cpus=""
+    local network=""
+    local verbose=0
+    local console=0
+    local cli_config=""
+    local -a exports=()
+    local -a exports_rw=()
+    local -a exports_cow=()
+    local cli_memory="" cli_cpus="" cli_network="" cli_display=""
+    local follow_git_worktrees=0
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help)
+                usage_start
+                exit 0
+                ;;
+            --export-ro)
+                [ $# -ge 2 ] || die "--export-ro requires an argument"
+                exports+=("$2")
+                shift 2
+                ;;
+            --export-rw)
+                [ $# -ge 2 ] || die "--export-rw requires an argument"
+                exports_rw+=("$2")
+                shift 2
+                ;;
+            --export-cow)
+                [ $# -ge 2 ] || die "--export-cow requires an argument"
+                exports_cow+=("$2")
+                shift 2
+                ;;
+            --dotfile)
+                die "--dotfile has been removed; use --export-ro instead"
+                ;;
+            --memory)
+                [ $# -ge 2 ] || die "--memory requires an argument"
+                cli_memory="$2"
+                shift 2
+                ;;
+            --cpus)
+                [ $# -ge 2 ] || die "--cpus requires an argument"
+                cli_cpus="$2"
+                shift 2
+                ;;
+            --config)
+                [ $# -ge 2 ] || die "--config requires an argument"
+                cli_config="$2"
+                shift 2
+                ;;
+            --no-network)
+                cli_network="0"
+                shift
+                ;;
+            --display)
+                [ $# -ge 2 ] || die "--display requires an argument (e.g. virtio, qxl, std)"
+                cli_display="$2"
+                shift 2
+                ;;
+            --verbose)
+                verbose=1
+                shift
+                ;;
+            --follow-git-worktrees)
+                follow_git_worktrees=1
+                shift
+                ;;
+            -*)
+                die "unknown option: $1"
+                ;;
+            *)
+                if [ -z "$name" ]; then
+                    name="$1"
+                else
+                    die "unexpected argument: $1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    # Load configuration file
+    local -a _cfg_exports=()
+    local -a _cfg_exports_rw=()
+    local -a _cfg_exports_cow=()
+    local -a _cfg_packages=()
+    local _cfg_container="" _cfg_command="" _cfg_memory="" _cfg_cpus="" _cfg_network="" _cfg_display="" _cfg_image_size="" _cfg_follow_git_worktrees=""
+    local config_file
+    if [ -n "$cli_config" ]; then
+        if [ ! -f "$cli_config" ]; then
+            die "config file not found: $cli_config"
+        fi
+        config_file="$cli_config"
+        todo "using config: $config_file"
+        load_config "$config_file"
+        todo_done
+    elif config_file=$(find_config_file "$PWD" "$name"); then
+        todo "using config: $config_file"
+        load_config "$config_file"
+        todo_done
+    fi
+
+    # Container name: CLI wins, then config
+    if [ -z "$name" ]; then
+        name="${_cfg_container}"
+    fi
+    if [ -z "$name" ]; then
+        die "container name required. See '$PROGNAME start --help'."
+    fi
+
+    validate_container_name "$name"
+
+    # Merge: config exports come first, CLI exports are appended
+    exports=("${_cfg_exports[@]}" "${exports[@]}")
+    exports_rw=("${_cfg_exports_rw[@]}" "${exports_rw[@]}")
+    exports_cow=("${_cfg_exports_cow[@]}" "${exports_cow[@]}")
+
+    # Scalars: CLI wins, then config, then built-in default
+    memory="${cli_memory:-${_cfg_memory:-4G}}"
+    cpus="${cli_cpus:-${_cfg_cpus}}"
+    network="${cli_network:-${_cfg_network:-1}}"
+    local display="${cli_display:-${_cfg_display}}"
+    if [ "$follow_git_worktrees" != "1" ] && [ "${_cfg_follow_git_worktrees}" = "1" ]; then
+        follow_git_worktrees=1
+    fi
+
+    check_prerequisites
+
+    local cache_dir="$CACHE_DIR/$name"
+    local image="$cache_dir/$name.qcow2"
+    if [ ! -f "$image" ]; then
+        die "no image found for '$name'. Run '$PROGNAME create $name' first."
+    fi
+
+    # Resolve $PWD to its physical path
+    local physical_pwd
+    if ! physical_pwd="$(realpath "$PWD" 2>/dev/null)" || [ -z "$physical_pwd" ]; then
+        die "cannot resolve current directory '$PWD' —" \
+            "it may have been deleted or permissions are insufficient."
+    fi
+
+    if [[ "$physical_pwd" == *" "* || "$physical_pwd" == *$'\t'* || "$physical_pwd" == *":"* ]]; then
+        die "current directory path contains whitespace or colons, which is not supported: $physical_pwd"
+    fi
+    if [[ "$HOME" == *" "* || "$HOME" == *$'\t'* || "$HOME" == *":"* ]]; then
+        die "\$HOME contains whitespace or colons, which is not supported: $HOME"
+    fi
+
+    # Classify each export path
+    local -a rw_mount_dirs=("$physical_pwd")
+    local -a ro_mount_dirs=()
+    local -a cow_mount_dirs=()
+    local -a rootfs_symlinks=()
+    local -a dotfiles=()
+
+    if [ "$PWD" != "$physical_pwd" ]; then
+        rootfs_symlinks+=("$PWD:$physical_pwd")
+    fi
+
+    for path in "${exports[@]}"; do
+        classify_export "$path" "ro"
+    done
+    for path in "${exports_rw[@]}"; do
+        classify_export "$path" "rw"
+    done
+    for path in "${exports_cow[@]}"; do
+        classify_export "$path" "cow"
+    done
+
+    if [ "$follow_git_worktrees" = "1" ]; then
+        local git_common_dir
+        git_common_dir=$(git -C "$physical_pwd" rev-parse --git-common-dir 2>/dev/null) || true
+        if [ -n "$git_common_dir" ] && [ "$git_common_dir" != ".git" ]; then
+            local resolved_git_dir
+            resolved_git_dir=$(realpath "$git_common_dir" 2>/dev/null) || true
+            if [ -n "$resolved_git_dir" ] && [ -d "$resolved_git_dir" ]; then
+                local already_exported=0
+                for d in "${rw_mount_dirs[@]}" "${ro_mount_dirs[@]}" "${cow_mount_dirs[@]}"; do
+                    if [[ "$resolved_git_dir" = "$d" ]] || [[ "$resolved_git_dir" = "$d/"* ]]; then
+                        already_exported=1
+                        break
+                    fi
+                done
+                if [ "$already_exported" = "0" ]; then
+                    info "exporting git common dir (worktree): $resolved_git_dir"
+                    rw_mount_dirs+=("$resolved_git_dir")
+                fi
+            fi
+        fi
+    fi
+
+    check_nested_export_conflicts
+
+    # Variables set by _boot_vm in our scope
+    local ssh_port="" session_image="" serial_log=""
+    local -a ssh_opts=()
+
+    # Set a temporary EXIT trap so boot failures are cleaned up
+    trap 'rm -f "$session_image" "$serial_log"; cleanup_vm' EXIT
+
+    # Boot the VM
+    _boot_vm
+
+    # VM is running — clear the EXIT trap so the VM survives our exit
+    trap - EXIT
+
+    info "VM '$name' is running (pid $QEMU_PID, ssh port $ssh_port)"
+    info "use '$PROGNAME join $name' to connect, '$PROGNAME stop $name' to shut down"
+}
+
+# ── Subcommand: stop ────────────────────────────────────────────────────────
+
+cmd_stop() {
+    local name=""
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help)
+                usage_stop
+                exit 0
+                ;;
+            -*)
+                die "unknown option: $1"
+                ;;
+            *)
+                if [ -z "$name" ]; then
+                    name="$1"
+                else
+                    die "unexpected argument: $1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    # Find matching sessions
+    local -a sessions=()
+    mapfile -t sessions < <(list_active_sessions "$name")
+    if [ ${#sessions[@]} -eq 1 ] && [ -z "${sessions[0]}" ]; then
+        sessions=()
+    fi
+
+    if [ ${#sessions[@]} -eq 0 ]; then
+        if [ -n "$name" ]; then
+            die "no running VM found for '$name'"
+        else
+            die "no running VMs found"
+        fi
+    fi
+
+    local session_file
+    if [ ${#sessions[@]} -eq 1 ]; then
+        session_file="${sessions[0]}"
+    else
+        # Multiple sessions — show them and ask the user to pick one
+        echo "Multiple running VMs found:"
+        echo ""
+        local idx=1
+        for sf in "${sessions[@]}"; do
+            local sf_name sf_pid sf_port sf_workdir sf_started
+            sf_name=$(read_session "$sf" "name")
+            sf_pid=$(read_session "$sf" "pid")
+            sf_port=$(read_session "$sf" "ssh_port")
+            sf_workdir=$(read_session "$sf" "workdir")
+            sf_started=$(read_session "$sf" "started_at")
+            printf "  %d) %s (pid %s, port %s, dir %s, started %s)\n" \
+                "$idx" "$sf_name" "$sf_pid" "$sf_port" "$sf_workdir" "$sf_started"
+            idx=$((idx + 1))
+        done
+        echo ""
+        printf "Select VM [1-%d]: " "${#sessions[@]}"
+        local choice
+        read -r choice
+        if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "${#sessions[@]}" ]; then
+            die "invalid selection"
+        fi
+        session_file="${sessions[$((choice - 1))]}"
+    fi
+
+    # Read session details
+    if [ -z "$name" ]; then
+        name=$(read_session "$session_file" "name")
+    fi
+    local vm_pid
+    vm_pid=$(read_session "$session_file" "pid")
+    local session_image serial_log
+    session_image=$(read_session "$session_file" "session_image")
+    serial_log=$(read_session "$session_file" "serial_log")
+
+    if ! kill -0 "$vm_pid" 2>/dev/null; then
+        info "VM '$name' (pid $vm_pid) is no longer running, cleaning up"
+        rm -f "$session_image" "$serial_log"
+        remove_session "$name" "$vm_pid"
+        return 0
+    fi
+
+    # Wait for active join sessions to finish
+    local joins
+    joins=$(count_active_joins "$name" "$vm_pid")
+    if [ "$joins" -gt 0 ]; then
+        warn "VM kept alive — $joins active join session(s) still connected"
+        info "waiting for join session(s) to disconnect before shutting down..."
+        local wait_count=0
+        while true; do
+            joins=$(count_active_joins "$name" "$vm_pid")
+            [ "$joins" -gt 0 ] || break
+            wait_count=$((wait_count + 1))
+            if [ "$wait_count" -ge 300 ]; then
+                warn "timed out waiting for join sessions after 300s, shutting down anyway"
+                break
+            fi
+            sleep 1
+        done
+        [ "$joins" -eq 0 ] && info "all join sessions disconnected"
+    fi
+
+    todo "shutting down VM '$name' (pid $vm_pid)..."
+
+    # Collect the full process tree (children before parents)
+    local -a pids
+    mapfile -t pids < <(_pstree_pids "$vm_pid")
+
+    # Graceful SIGTERM to the whole tree
+    for pid in "${pids[@]}"; do
+        kill "$pid" 2>/dev/null
+    done
+
+    # Give them a moment to shut down
+    local i=0
+    while kill -0 "$vm_pid" 2>/dev/null && [ "$i" -lt 5 ]; do
+        sleep 1
+        i=$((i + 1))
+    done
+
+    # Force kill any survivors
+    if kill -0 "$vm_pid" 2>/dev/null; then
+        mapfile -t pids < <(_pstree_pids "$vm_pid")
+        for pid in "${pids[@]}"; do
+            kill -9 "$pid" 2>/dev/null
+        done
+    fi
+    todo_done
+
+    # Clean up session snapshot, serial log, and session file
+    rm -f "$session_image" "$serial_log"
+    remove_session "$name" "$vm_pid"
 }
 
 # ── Subcommand: join ────────────────────────────────────────────────────────
@@ -2419,6 +2865,12 @@ main() {
             ;;
         enter)
             cmd_enter "$@"
+            ;;
+        start)
+            cmd_start "$@"
+            ;;
+        stop)
+            cmd_stop "$@"
             ;;
         join)
             cmd_join "$@"
