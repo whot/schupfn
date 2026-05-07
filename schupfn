@@ -1645,22 +1645,20 @@ SSHD_SVC
     _brun mkdir -p "$homedir/.ssh"
 
     # Inject SSH authorized keys
-    {
-        cat "${image_key}.pub"
-        for pub in "$HOME"/.ssh/id_*.pub; do
-            [ -f "$pub" ] && cat "$pub"
-        done
-    } | _bwrite "${homedir}/.ssh/authorized_keys" 0600
+    [ -f "${image_key}.pub" ] || die "SSH public key not found at ${image_key}.pub"
+    local ak_tmp
+    ak_tmp=$(mktemp)
+    trap 'rm -f "$ak_tmp"' RETURN
+    cat "${image_key}.pub" > "$ak_tmp"
+    for pub in "$HOME"/.ssh/id_*.pub; do
+        [ -f "$pub" ] && cat "$pub" >> "$ak_tmp"
+    done
+    buildah copy --chmod 0600 "$wc" "$ak_tmp" "${homedir}/.ssh/authorized_keys" >/dev/null
 
     # Also inject for root
     _brun mkdir -p /root/.ssh
     _brun chmod 700 /root/.ssh
-    {
-        cat "${image_key}.pub"
-        for pub in "$HOME"/.ssh/id_*.pub; do
-            [ -f "$pub" ] && cat "$pub"
-        done
-    } | _bwrite /root/.ssh/authorized_keys 0600
+    buildah copy --chmod 0600 "$wc" "$ak_tmp" /root/.ssh/authorized_keys >/dev/null
 
     _brun chmod 700 "${homedir}/.ssh"
 
