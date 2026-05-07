@@ -1677,6 +1677,7 @@ SSHD_SVC
         todo "continuing with setup"
     fi
 
+    _brun bash -c 'echo "root:schupfn" | chpasswd'
     _brun bash -c "grep -q '^${groupname}:' /etc/group || echo '${groupname}:x:${gid}:' >> /etc/group"
     _brun bash -c "grep -q '^${username}:' /etc/passwd || echo '${username}:x:${uid}:${gid}::${homedir}:${shell}' >> /etc/passwd"
     _brun mkdir -p "$homedir/.ssh"
