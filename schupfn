@@ -1341,7 +1341,7 @@ export_image() {
     # ── SSH setup ───────────────────────────────────────────────────────
 
     # Remove stale host keys and regenerate
-    _brun bash -c 'rm -f /etc/ssh/ssh_host_*key* && ssh-keygen -A'
+    _brun bash -c 'rm -f /etc/ssh/ssh_host_*key* && ssh-keygen -q -A > /dev/null'
 
     # Disable all stock sshd mechanisms
     _brun bash -c 'rm -f /etc/systemd/system/multi-user.target.wants/sshd.service 2>/dev/null || true'
@@ -1524,7 +1524,7 @@ NETSVC
 
     info "creating ${image_size} qcow2 image..."
     if ! virt-make-fs --format=qcow2 --type=ext4 --size="$image_size" \
-            "$tarball" "$image"; then
+            "$tarball" "$image" > /dev/null; then
         rm -f "$tarball" "$image"
         die "failed to create disk image"
     fi
@@ -1541,7 +1541,7 @@ NETSVC
     # 2. guestfish for chown (direct filesystem access, no post-processing)
 
     info "fixing permissions..."
-    if ! virt-customize -a "$image" --no-network --no-selinux-relabel \
+    if ! virt-customize -q -a "$image" --no-network --no-selinux-relabel \
             --run-command 'chown -R root:root /etc' \
             --run-command 'rpm --setperms -a 2>/dev/null || true' \
             --run-command 'rpm --setugids -a 2>/dev/null || true'; then
