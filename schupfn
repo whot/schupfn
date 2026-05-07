@@ -648,6 +648,7 @@ find_config_file() {
 #   _cfg_network    - "0" if network: false, empty if not set
 #   _cfg_display    - VM display adapter type, empty if not set
 #   _cfg_image_size - disk image size (from image.size), empty if not set
+#   _cfg_packages   - array of packages to install in the image (from image.install-packages)
 #   _cfg_follow_git_worktrees - "1" if follow-git-worktrees: true, empty if not set
 load_config() {
     local config_file="$1"
@@ -687,6 +688,8 @@ load_config() {
         (.["export-rw"] // [] | .[]),
         "__EXPORT_COW__",
         (.["export-cow"] // [] | .[]),
+        "__PACKAGES__",
+        (.image["install-packages"] // [] | .[]),
         "__KEYS__",
         ([.. | path | map(select(tag != "!!int")) | join(".")] | unique | .[])
     ' "$config_file" 2>/dev/null) || die "failed to parse config file: $config_file"
@@ -696,7 +699,7 @@ load_config() {
     local raw_cpus="" raw_network="" raw_follow_git_worktrees=""
     while IFS= read -r line; do
         case "$line" in
-            __SCALARS__|__EXPORT_RO__|__EXPORT_RW__|__EXPORT_COW__|__KEYS__)
+            __SCALARS__|__EXPORT_RO__|__EXPORT_RW__|__EXPORT_COW__|__PACKAGES__|__KEYS__)
                 section="$line"; continue ;;
         esac
 
@@ -733,9 +736,12 @@ load_config() {
                     _cfg_exports_cow+=("$line")
                 fi
                 ;;
+            __PACKAGES__)
+                [ -n "$line" ] && _cfg_packages+=("$line")
+                ;;
             __KEYS__)
                 [ -z "$line" ] && continue
-                local _known_keys=" container command export-ro export-rw export-cow follow-git-worktrees image image.size vm vm.memory vm.cpus vm.network vm.display "
+                local _known_keys=" container command export-ro export-rw export-cow follow-git-worktrees image image.size image.install-packages vm vm.memory vm.cpus vm.network vm.display "
                 if [[ "$_known_keys" != *" $line "* ]]; then
                     warn "unknown config key '$line' in $config_file"
                 fi
@@ -853,18 +859,25 @@ Options:
   --image-size <size>
                     Size of the qcow2 disk image, e.g. 4G, 10G.
                     Default: auto-sized from container (tarball + 50% headroom)
+  --install-packages <pkg>
+                    Install additional packages in the image (repeatable).
+                    Packages are installed via dnf before the image is finalized.
   --config <path>   Use <path> as config file instead of searching for one
   -h, --help        Show this help
 
 Configuration file:
   schupfn searches from \$PWD upward for .schupfn/config.yml. The first
   file found is loaded. Use --config to specify an explicit path instead.
-  CLI arguments override config values.
+  CLI arguments override config values; for --install-packages the config
+  and CLI lists are merged.
 
   Example .schupfn/config.yml:
     container: my-toolbox
     image:
       size: 10G
+      install-packages:
+        - zsh
+        - vim
 EOF
 }
 
@@ -1099,6 +1112,8 @@ export_image() {
     local name="$1"
     local cache_dir="$2"
     local user_image_size="${3:-}"
+    shift 3 || shift $#
+    local -a packages=("$@")
 
     info "exporting container '$name' to disk image..."
 
@@ -1272,7 +1287,21 @@ SSHD_SVC
     # D-Bus which isn't running inside a buildah container)
     _brun bash -c 'mkdir -p /etc/systemd/system/multi-user.target.wants && ln -sf /etc/systemd/system/schupfn-sshd.service /etc/systemd/system/multi-user.target.wants/'
 
+    todo_done
+
+    # ── Extra packages ─────────────────────────────────────────────────
+
+    if [ ${#packages[@]} -gt 0 ]; then
+        todo "installing extra packages: ${packages[*]}"
+        dnf_msgs=$(mktemp)
+        trap 'rm -f "$dnf_msgs"' RETURN
+        _brun bash -c "dnf -q install -y ${packages[*]} >/dev/null 2>$dnf_msgs" \
+            || die "failed to install packages: ${packages[*]}: $(cat "$dnf_msgs")"
+        todo_done
+    fi
+
     # ── User setup ──────────────────────────────────────────────────────
+    todo "finishing setup"
 
     # Verify the user's login shell exists inside the image; fall back
     # to /bin/bash if it doesn't (e.g. host uses zsh but the container
@@ -1463,6 +1492,7 @@ cmd_create() {
     local force=0
     local cli_config=""
     local cli_image_size=""
+    local -a cli_packages=()
 
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -1480,6 +1510,11 @@ cmd_create() {
                     die "invalid --image-size format '$2': expected a number followed by K, M, G, or T (e.g. 4G, 10G, 512M)"
                 fi
                 cli_image_size="$2"
+                shift 2
+                ;;
+            --install-packages)
+                [ $# -ge 2 ] || die "--install-packages requires an argument"
+                cli_packages+=("$2")
                 shift 2
                 ;;
             --config)
@@ -1509,6 +1544,7 @@ cmd_create() {
     local -a _cfg_exports=()
     local -a _cfg_exports_rw=()
     local -a _cfg_exports_cow=()
+    local -a _cfg_packages=()
     local _cfg_container="" _cfg_command="" _cfg_memory="" _cfg_cpus="" _cfg_network="" _cfg_display="" _cfg_image_size="" _cfg_follow_git_worktrees=""
     local config_file
     if [ -n "$cli_config" ]; then
@@ -1537,6 +1573,9 @@ cmd_create() {
 
     local image_size="${cli_image_size:-${_cfg_image_size}}"
 
+    # Merge: config packages come first, CLI packages are appended
+    local -a packages=("${_cfg_packages[@]}" "${cli_packages[@]}")
+
     check_prerequisites
 
     # Verify the container exists
@@ -1555,7 +1594,7 @@ cmd_create() {
         die "image for '$name' already exists. Use --force to rebuild."
     fi
 
-    export_image "$name" "$cache_dir" "$image_size"
+    export_image "$name" "$cache_dir" "$image_size" "${packages[@]}"
 
     info "image ready: $image"
 }
@@ -1664,6 +1703,7 @@ cmd_enter() {
     local -a _cfg_exports=()
     local -a _cfg_exports_rw=()
     local -a _cfg_exports_cow=()
+    local -a _cfg_packages=()
     local _cfg_container="" _cfg_command="" _cfg_memory="" _cfg_cpus="" _cfg_network="" _cfg_display="" _cfg_image_size="" _cfg_follow_git_worktrees=""
     local config_file
     if [ -n "$cli_config" ]; then
