@@ -2179,21 +2179,6 @@ cmd_enter() {
         -p "$ssh_port"
     )
 
-    # Quick sanity test: try a non-interactive SSH command first to
-    # verify authentication works, before copying files or opening
-    # an interactive session.
-    if ! ssh "${ssh_opts[@]}" \
-            -o BatchMode=yes \
-            -l "$username" \
-            127.0.0.1 "echo schupfn-auth-ok" 2>/dev/null | grep -q "schupfn-auth-ok"; then
-        warn "SSH authentication test failed. Trying with verbose output..."
-        ssh -v "${ssh_opts[@]}" \
-            -o BatchMode=yes \
-            -l "$username" \
-            127.0.0.1 "echo schupfn-auth-ok" 2>&1 >&2
-        die "SSH authentication failed for user '$username'"
-    fi
-
     # Create symlinks inside the VM for any symlinked export paths.
     # The mounts are already ready (sshd waits for schupfn-mounts.service).
     if [ ${#rootfs_symlinks[@]} -gt 0 ]; then
