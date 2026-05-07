@@ -1687,6 +1687,9 @@ SSHD_SVC
     _bwrite /usr/local/bin/schupfn-network.sh 0755 <<'NETSCRIPT'
 #!/bin/bash
 modprobe virtio_net 2>/dev/null
+# Wait for udev to finish processing device events so the
+# virtio-net interface is fully registered before we look for it.
+udevadm settle --timeout=10 2>/dev/null || true
 for i in $(seq 1 20); do
     iface=$(ls /sys/class/net/ 2>/dev/null | grep -v lo | head -1)
     [ -n "$iface" ] && break
@@ -1709,12 +1712,13 @@ NETSCRIPT
 Description=schupfn network setup
 After=systemd-modules-load.service systemd-udevd.service
 Before=network.target schupfn-sshd.service
-Wants=network.target
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/local/bin/schupfn-network.sh
+Restart=on-failure
+RestartSec=1
 
 [Install]
 WantedBy=multi-user.target
