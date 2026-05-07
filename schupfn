@@ -51,6 +51,14 @@ info() {
     echo "${C_CYAN}::${C_RESET_OUT} $*"
 }
 
+todo() {
+    stdbuf -oL echo -n " - $*"
+}
+
+todo_done() {
+    echo -e "\r ✓"
+}
+
 check_command() {
     command -v "$1" >/dev/null 2>&1 || die "'$1' is not installed or not in PATH"
 }
@@ -221,11 +229,11 @@ check_container_prerequisites() {
     read -r answer
     case "$answer" in
         y|Y|yes|YES)
-            info "installing ${missing[*]} in container '$name'..."
+            todo "installing ${missing[*]} in container '$name'..."
             if ! toolbox run -c "$name" sudo dnf -q install -y "${missing[@]}"; then
                 die "failed to install packages"
             fi
-            info "packages installed"
+            todo_done "packages installed"
             ;;
         *)
             die "cannot continue without: ${missing[*]}"
@@ -265,7 +273,7 @@ wait_for_ssh() {
         key_flags+=(-i "$k")
     done
 
-    info "waiting for VM to boot..."
+    todo "waiting for VM to boot..."
 
     local port_reached=0
 
@@ -292,7 +300,8 @@ wait_for_ssh() {
         if [ "$port_reached" = "0" ]; then
             if bash -c "echo >/dev/tcp/127.0.0.1/$port" 2>/dev/null; then
                 port_reached=1
-                info "SSH port is open, authenticating..."
+                todo_done # that's the 'waiting for vm to boot'
+                todo "SSH port is open, testing authentication..."
             fi
         fi
 
@@ -310,6 +319,7 @@ wait_for_ssh() {
                "${key_flags[@]}" \
                -p "$port" \
                127.0.0.1 true >/dev/null 2>&1; then
+            todo_done
             return 0
         fi
 
@@ -377,7 +387,7 @@ cleanup_vm() {
             fi
         fi
 
-        info "shutting down VM (pid $QEMU_PID)..."
+        todo "shutting down VM (pid $QEMU_PID)..."
         # Collect the full process tree (children before parents)
         local -a pids
         mapfile -t pids < <(_pstree_pids "$QEMU_PID")
@@ -402,6 +412,8 @@ cleanup_vm() {
             done
         fi
         wait "$QEMU_PID" 2>/dev/null
+
+        todo_done
     fi
 
     # Remove session file after shutdown so the VM remains discoverable
@@ -1258,7 +1270,7 @@ export_image() {
     # The only things that can't be done here are setuid/ownership
     # fixes — those need real root (virt-customize phase).
 
-    info "preparing container filesystem..."
+    todo "preparing container filesystem..."
 
     # Commit the container's current filesystem (including all packages
     # installed by the user) to a temporary image, then create a buildah
@@ -1473,7 +1485,8 @@ NETSVC
 
     # ── Export ──────────────────────────────────────────────────────────
 
-    info "exporting prepared container..."
+    todo_done
+    todo "exporting prepared container..."
     local prepared_image="localhost/schupfn-prepared-$name"
     if ! buildah commit --rm --squash "$wc" "$prepared_image" >/dev/null 2>&1; then
         buildah rm "$wc" >/dev/null 2>&1
@@ -1522,7 +1535,8 @@ NETSVC
         image_size="${image_size_gb}G"
     fi
 
-    info "creating ${image_size} qcow2 image..."
+    todo_done
+    todo "creating ${image_size} qcow2 image..."
     if ! virt-make-fs --format=qcow2 --type=ext4 --size="$image_size" \
             "$tarball" "$image" > /dev/null; then
         rm -f "$tarball" "$image"
@@ -1530,6 +1544,8 @@ NETSVC
     fi
 
     rm -f "$tarball"
+
+    todo_done
 
     # ── Phase 3: fix permissions (needs real root) ──────────────────────
     #
@@ -1540,7 +1556,7 @@ NETSVC
     #    system with rpm database access)
     # 2. guestfish for chown (direct filesystem access, no post-processing)
 
-    info "fixing permissions..."
+    todo "fixing permissions..."
     if ! virt-customize -q -a "$image" --no-network --no-selinux-relabel \
             --run-command 'chown -R root:root /etc' \
             --run-command 'rpm --setperms -a 2>/dev/null || true' \
@@ -1548,7 +1564,8 @@ NETSVC
         die "failed to fix image permissions"
     fi
 
-
+    todo_done
+    todo "collecting metadata..."
 
     # Gather state and write metadata
     local state
@@ -1572,6 +1589,7 @@ NETSVC
     if [ -n "$diff_hash" ]; then
         echo "diff_hash=$diff_hash" >> "$cache_dir/$META_FILE"
     fi
+    todo_done
 }
 
 # ── Subcommand: create ──────────────────────────────────────────────────────
@@ -1639,11 +1657,13 @@ cmd_create() {
             die "config file not found: $cli_config"
         fi
         config_file="$cli_config"
-        info "using config: $config_file"
+        todo "loading config: $config_file"
         load_config "$config_file"
+        todo_done
     elif config_file=$(find_config_file "$PWD" "$name"); then
-        info "using config: $config_file"
+        todo "loading config: $config_file"
         load_config "$config_file"
+        todo_done
     fi
 
     # Container name: CLI wins, then config
@@ -1805,11 +1825,13 @@ cmd_enter() {
             die "config file not found: $cli_config"
         fi
         config_file="$cli_config"
-        info "using config: $config_file"
+        todo "using config: $config_file"
         load_config "$config_file"
+        todo_done
     elif config_file=$(find_config_file "$PWD" "$name"); then
-        info "using config: $config_file"
+        todo "using config: $config_file"
         load_config "$config_file"
+        todo_done
     fi
 
     # Container name: CLI wins, then config
@@ -2050,26 +2072,29 @@ cmd_enter() {
     local fs_idx=0
     for dir in "${rw_mount_dirs[@]}"; do
         local tag="schupfn_rw_${fs_idx}"
-        info "exporting directory (rw): $dir"
+        todo "exporting directory (rw): $dir"
         qemu_cmd+=(-virtfs "local,path=$dir,mount_tag=$tag,security_model=none,id=fs${fs_idx}")
         kernel_args+=("schupfn.9p=${tag}:${dir}:rw")
         fs_idx=$((fs_idx + 1))
+        todo_done
     done
 
     for dir in "${ro_mount_dirs[@]}"; do
         local tag="schupfn_ro_${fs_idx}"
-        info "exporting directory (ro): $dir"
+        todo "exporting directory (ro): $dir"
         qemu_cmd+=(-virtfs "local,path=$dir,mount_tag=$tag,security_model=none,id=fs${fs_idx},readonly=on")
         kernel_args+=("schupfn.9p=${tag}:${dir}:ro")
         fs_idx=$((fs_idx + 1))
+        todo_done
     done
 
     for dir in "${cow_mount_dirs[@]}"; do
         local tag="schupfn_cow_${fs_idx}"
-        info "exporting directory (cow): $dir"
+        todo "exporting directory (cow): $dir"
         qemu_cmd+=(-virtfs "local,path=$dir,mount_tag=$tag,security_model=none,id=fs${fs_idx},readonly=on")
         kernel_args+=("schupfn.9p=${tag}:${dir}:cow")
         fs_idx=$((fs_idx + 1))
+        todo_done
     done
 
     # Mount host kernel modules so the VM can load them (e.g. virtio_net)
@@ -2098,7 +2123,7 @@ cmd_enter() {
     fi
 
     # ── Normal mode: run qemu in the background, connect via SSH ─────
-    info "starting VM '$name' (ssh port $ssh_port)..."
+    todo "starting VM '$name' (ssh port $ssh_port)..."
 
     # Run qemu in the background.  Serial output goes to a file
     # (-serial file:...) so there is no monitor on stdin and /dev/null
@@ -2121,6 +2146,8 @@ cmd_enter() {
         tail_pid=$!
     fi
 
+    todo_done
+
     # Wait for SSH to become available
     wait_for_ssh "$ssh_port" "$image_key"
 
@@ -2130,11 +2157,11 @@ cmd_enter() {
         wait "$tail_pid" 2>/dev/null
     fi
 
+    todo "VM is up, registering session for schupfn join"
     # Register this VM session so 'schupfn join' can find it
     # Store the image key in the session file for join to use
     write_session "$name" "$QEMU_PID" "$ssh_port" "$PWD" "$image_key"
-
-    info "VM is up, connecting"
+    todo_done
 
     # Common SSH options.
     # -4: force IPv4 (qemu SLIRP hostfwd binds to 127.0.0.1)
@@ -2174,8 +2201,9 @@ cmd_enter() {
         for entry in "${rootfs_symlinks[@]}"; do
             local link_path="${entry%%:*}"
             local target="${entry#*:}"
-            info "creating symlink: $link_path -> $target"
+            todo "creating symlink: $link_path -> $target"
             local escaped_dir escaped_link escaped_target
+            todo_done
             escaped_dir=$(printf '%q' "$(dirname "$link_path")")
             escaped_link=$(printf '%q' "$link_path")
             escaped_target=$(printf '%q' "$target")
@@ -2192,8 +2220,9 @@ cmd_enter() {
     if [ ${#dotfiles[@]} -gt 0 ]; then
         local -a tar_paths=()
         for df in "${dotfiles[@]}"; do
-            info "copying file: $df"
+            todo "copying file: $df"
             tar_paths+=("${df#/}")
+            todo_done
         done
 
         tar -chf - -C / "${tar_paths[@]}" | \
@@ -2211,6 +2240,8 @@ cmd_enter() {
     else
         remote_cmd="cd $quoted_pwd && exec \$SHELL -l"
     fi
+
+    info "Entering VM based on '$name' now."
 
     ssh -t \
         "${ssh_opts[@]}" \
@@ -2458,8 +2489,9 @@ cmd_clean() {
             die "no cached image for '$name'"
         fi
 
-        info "removing cached image for '$name'..."
+        todo "removing cached image for '$name'..."
         rm -rf "$cache_entry"
+        todo_done
         return
     fi
 
