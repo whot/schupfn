@@ -1640,8 +1640,12 @@ SSHD_SVC
     fi
 
     _brun bash -c 'echo "root:schupfn" | chpasswd'
-    _brun bash -c "grep -q '^${groupname}:' /etc/group || echo '${groupname}:x:${gid}:' >> /etc/group"
-    _brun bash -c "grep -q '^${username}:' /etc/passwd || echo '${username}:x:${uid}:${gid}::${homedir}:${shell}' >> /etc/passwd"
+    _brun bash -c "sed -i '/^${groupname}:/d' /etc/group; echo '${groupname}:x:${gid}:' >> /etc/group"
+    # Replace or add the user's passwd entry.  Toolbox containers have
+    # the user with an empty password field; we need 'x' so sshd
+    # defers to /etc/shadow.  Also update the shell to $shell which
+    # may have been changed to /bin/bash if the original wasn't found.
+    _brun bash -c "sed -i '/^${username}:/d' /etc/passwd; echo '${username}:x:${uid}:${gid}::${homedir}:${shell}' >> /etc/passwd"
     _brun mkdir -p "$homedir/.ssh"
 
     # Inject SSH authorized keys
@@ -1662,7 +1666,13 @@ SSHD_SVC
 
     _brun chmod 700 "${homedir}/.ssh"
 
-    # Passwordless sudo: add user to wheel and enable NOPASSWD for wheel
+    # The user's /etc/shadow entry must not have a '!' or '!!' password
+    # hash — Fedora's sshd rejects all auth (including pubkey) for
+    # accounts with a locked password prefix.  Replace the password
+    # field with '*' (disabled but not locked).
+    _brun bash -c "if grep -q '^${username}:' /etc/shadow; then sed -i 's/^${username}:[^:]*:/${username}:*:/' /etc/shadow; else echo '${username}:*:::::::' >> /etc/shadow; fi"
+
+    # Passwordless sudo: add user to wheel and enable NOPASSWD for wheel.
     _brun bash -c "usermod -aG wheel ${username} 2>/dev/null || (grep -q '^wheel:' /etc/group && sed -i 's/^wheel:x:\([0-9]*\):.*/&,${username}/' /etc/group)"
     _brun bash -c "sed -i 's/^# *%wheel.*NOPASSWD.*ALL$/%wheel ALL=(ALL) NOPASSWD: ALL/' /etc/sudoers 2>/dev/null || true"
 
