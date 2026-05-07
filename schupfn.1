@@ -71,16 +71,14 @@ If any are missing,
 .B schupfn
 will offer to install them.
 .PP
+If the image already exists, the command exits with an error unless
+.B \-\-force
+is given.
+.PP
 The options are as follows:
 .TP
-.B \-\-refresh
-Force re\-export of the disk image, even if the cached copy appears fresh.
-.TP
-.B \-\-deep\-check
-Use
-.B podman diff
-for more thorough staleness detection when deciding whether to
-re\-export.
+.B \-\-force
+Rebuild the image even if one already exists.
 .TP
 .BI \-\-image\-size " size"
 Size of the qcow2 disk image, e.g.\&
@@ -226,18 +224,10 @@ The exit code of
 is propagated as the exit code of
 .BR schupfn .
 .SS list
-Show cached VM images with their freshness status, number of
+Show cached VM images with their status, number of
 running VMs, size, and export date.
-Freshness is one of:
-.TP
-.B fresh
-The cached image matches the current container state.
-.TP
-.B stale
-The container has changed since the image was exported.
-.TP
-.B orphaned
-The container no longer exists.
+Images whose source container no longer exists are marked
+.BR orphaned .
 .SS clean \fR[\fIname\fR]
 Remove cached VM images.
 If
