@@ -1572,8 +1572,6 @@ NETSVC
     if [ -n "$diff_hash" ]; then
         echo "diff_hash=$diff_hash" >> "$cache_dir/$META_FILE"
     fi
-
-    info "export complete"
 }
 
 # ── Subcommand: create ──────────────────────────────────────────────────────
@@ -1693,6 +1691,7 @@ cmd_create() {
     fi
 
     info "image ready: $image"
+    info "use 'schupfn enter $name' to boot"
 }
 
 # ── Subcommand: enter ───────────────────────────────────────────────────────
@@ -2461,7 +2460,6 @@ cmd_clean() {
 
         info "removing cached image for '$name'..."
         rm -rf "$cache_entry"
-        info "done"
         return
     fi
 
