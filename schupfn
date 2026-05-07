@@ -838,7 +838,10 @@ usage_create() {
 Usage: $PROGNAME create [<name>] [options]
 
 Export the toolbox container <name> to a qcow2 disk image. The image is
-cached and reused by 'schupfn enter' until the container changes.
+cached and reused by '$PROGNAME enter'.
+
+If an image already exists, the command exits with an error unless --force
+is given.
 
 If <name> is omitted, the 'container' field from the config file is used.
 
@@ -846,8 +849,7 @@ The container must have these packages installed:
   openssh-server, systemd-udev, dbus-broker
 
 Options:
-  --refresh         Force re-export of the image even if it appears fresh
-  --deep-check      Use 'podman diff' for thorough staleness detection
+  --force           Rebuild the image even if one already exists
   --image-size <size>
                     Size of the qcow2 disk image, e.g. 4G, 10G.
                     Default: auto-sized from container (tarball + 50% headroom)
@@ -890,14 +892,8 @@ EOF
 # Write metadata file after a successful export
 write_meta() {
     local cache_dir="$1"
-    local image_id="$2"
-    local container_id="$3"
-    local inspect_hash="$4"
 
     cat > "$cache_dir/$META_FILE" <<EOF
-image_id=$image_id
-container_id=$container_id
-inspect_hash=$inspect_hash
 exported_at=$(date -Iseconds)
 EOF
 }
@@ -919,127 +915,6 @@ read_meta() {
             return 0
         fi
     done < "$meta_path"
-    return 0
-}
-
-# Gather current container state and return as key=value lines.
-gather_container_state() {
-    local name="$1"
-
-    # One podman inspect: --format gives us both IDs and the last
-    # started timestamp on separate lines.
-    local state_info
-    state_info=$(podman inspect --format '{{.Image}}{{"\n"}}{{.Id}}{{"\n"}}{{.State.StartedAt}}' "$name" 2>/dev/null) \
-        || die "failed to inspect container '$name'"
-
-    local image_id container_id started_at
-    { read -r image_id; read -r container_id; read -r started_at; } <<< "$state_info"
-
-    if [ -z "$image_id" ]; then
-        die "failed to get image ID for container '$name'"
-    fi
-    if [ -z "$container_id" ]; then
-        die "failed to get container ID for '$name'"
-    fi
-
-    # Hash the full JSON for change detection.
-    local inspect_hash_raw
-    inspect_hash_raw=$(podman inspect "$name" 2>/dev/null | sha256sum)
-    local inspect_hash="${inspect_hash_raw%%[[:space:]]*}"
-
-    if [ -z "$inspect_hash" ]; then
-        die "failed to compute inspect hash for '$name'"
-    fi
-
-    echo "image_id=$image_id"
-    echo "container_id=$container_id"
-    echo "inspect_hash=$inspect_hash"
-    echo "started_at=$started_at"
-}
-
-# Check whether the cached image is fresh.
-# Returns 0 if fresh, 1 if stale or missing.
-check_freshness() {
-    local name="$1"
-    local cache_dir="$2"
-    local deep_check="$3"
-
-    if [ ! -d "$cache_dir" ] || [ ! -f "$cache_dir/$META_FILE" ] || [ ! -f "$cache_dir/$name.qcow2" ]; then
-        info "no cached image found for '$name'"
-        return 1
-    fi
-
-    local stored_image_id stored_container_id stored_inspect_hash
-    stored_image_id=$(read_meta "$cache_dir" "image_id")
-    stored_container_id=$(read_meta "$cache_dir" "container_id")
-    stored_inspect_hash=$(read_meta "$cache_dir" "inspect_hash")
-
-    # Gather current state
-    local current_state
-    current_state=$(gather_container_state "$name")
-
-    local current_image_id="" current_container_id="" current_inspect_hash="" current_started_at=""
-    while IFS='=' read -r k v; do
-        case "$k" in
-            image_id)       current_image_id="$v" ;;
-            container_id)   current_container_id="$v" ;;
-            inspect_hash)   current_inspect_hash="$v" ;;
-            started_at)     current_started_at="$v" ;;
-        esac
-    done <<< "$current_state"
-
-    if [ "$stored_image_id" != "$current_image_id" ]; then
-        info "image ID changed for '$name'"
-        return 1
-    fi
-
-    if [ "$stored_container_id" != "$current_container_id" ]; then
-        info "container ID changed for '$name'"
-        return 1
-    fi
-
-    if [ "$stored_inspect_hash" != "$current_inspect_hash" ]; then
-        info "container configuration changed for '$name'"
-        return 1
-    fi
-
-    # Check if the container was started after the last export.
-    # When the user runs "toolbox run -c <name> sudo dnf install ...",
-    # the container is started, which updates StartedAt.  If this is
-    # newer than our export timestamp, the container may have changed.
-    local stored_exported_at
-    stored_exported_at=$(read_meta "$cache_dir" "exported_at")
-    if [ -n "$current_started_at" ] && [ -n "$stored_exported_at" ]; then
-        # Compare timestamps — both are ISO 8601 format, sortable
-        # as strings.  Normalize to comparable format.
-        local export_ts start_ts
-        export_ts=$(date -d "$stored_exported_at" +%s 2>/dev/null) || export_ts=0
-        start_ts=$(date -d "$current_started_at" +%s 2>/dev/null) || start_ts=0
-        if [ "$start_ts" -gt "$export_ts" ]; then
-            info "container '$name' was started after last export"
-            return 1
-        fi
-    fi
-
-    if [ "$deep_check" = "1" ]; then
-        info "running deep check (podman diff) for '$name'..."
-        local diff_hash_raw
-        diff_hash_raw=$(podman diff "$name" 2>/dev/null | sha256sum)
-        local diff_hash="${diff_hash_raw%%[[:space:]]*}"
-        if [ -z "$diff_hash" ]; then
-            warn "podman diff failed, treating image as stale"
-            return 1
-        fi
-
-        local stored_diff_hash
-        stored_diff_hash=$(read_meta "$cache_dir" "diff_hash")
-
-        if [ "$stored_diff_hash" != "$diff_hash" ]; then
-            info "filesystem changes detected in '$name'"
-            return 1
-        fi
-    fi
-
     return 0
 }
 
@@ -1565,30 +1440,9 @@ NETSVC
     fi
 
     todo_done
-    todo "collecting metadata..."
+    todo "writing metadata..."
 
-    # Gather state and write metadata
-    local state
-    state=$(gather_container_state "$name")
-
-    local image_id="" container_id="" inspect_hash=""
-    while IFS='=' read -r k v; do
-        case "$k" in
-            image_id)       image_id="$v" ;;
-            container_id)   container_id="$v" ;;
-            inspect_hash)   inspect_hash="$v" ;;
-        esac
-    done <<< "$state"
-
-    # Also compute and store the diff hash for --deep-check freshness
-    local diff_hash_raw
-    diff_hash_raw=$(podman diff "$name" 2>/dev/null | sha256sum)
-    local diff_hash="${diff_hash_raw%%[[:space:]]*}"
-
-    write_meta "$cache_dir" "$image_id" "$container_id" "$inspect_hash"
-    if [ -n "$diff_hash" ]; then
-        echo "diff_hash=$diff_hash" >> "$cache_dir/$META_FILE"
-    fi
+    write_meta "$cache_dir"
     todo_done
 }
 
@@ -1596,8 +1450,7 @@ NETSVC
 
 cmd_create() {
     local name=""
-    local refresh=0
-    local deep_check=0
+    local force=0
     local cli_config=""
     local cli_image_size=""
 
@@ -1607,12 +1460,8 @@ cmd_create() {
                 usage_create
                 exit 0
                 ;;
-            --refresh)
-                refresh=1
-                shift
-                ;;
-            --deep-check)
-                deep_check=1
+            --force)
+                force=1
                 shift
                 ;;
             --image-size)
@@ -1689,29 +1538,16 @@ cmd_create() {
     check_container_prerequisites "$name"
 
     local cache_dir="$CACHE_DIR/$name"
-
-    # Check freshness (unless --refresh forces re-export)
-    local need_export=0
-    if [ "$refresh" = "1" ]; then
-        info "forced refresh requested"
-        need_export=1
-    elif ! check_freshness "$name" "$cache_dir" "$deep_check"; then
-        need_export=1
-    else
-        info "image for '$name' is up to date"
-    fi
-
-    if [ "$need_export" = "1" ]; then
-        export_image "$name" "$cache_dir" "$image_size"
-    fi
-
     local image="$cache_dir/$name.qcow2"
-    if [ ! -f "$image" ]; then
-        die "disk image not found at $image"
+
+    # If the image already exists, require --force to rebuild
+    if [ -f "$image" ] && [ "$force" != "1" ]; then
+        die "image for '$name' already exists. Use --force to rebuild."
     fi
+
+    export_image "$name" "$cache_dir" "$image_size"
 
     info "image ready: $image"
-    info "use 'schupfn enter $name' to boot"
 }
 
 # ── Subcommand: enter ───────────────────────────────────────────────────────
@@ -1965,7 +1801,7 @@ cmd_enter() {
     # host's crypto-policy or what key types the user has.
     local image_key="$cache_dir/ssh_key"
     if [ ! -f "$image_key" ]; then
-        die "image SSH key not found at $image_key — try '$PROGNAME create $name --refresh' to rebuild the image"
+        die "image SSH key not found at $image_key — try '$PROGNAME create $name --force' to rebuild the image"
     fi
 
     local -a key_args=(-i "$image_key")
@@ -2433,15 +2269,9 @@ cmd_list() {
             exported_at="unknown"
         fi
 
-        # Check freshness
-        local status="unknown"
-        if podman container inspect "$name" >/dev/null 2>&1; then
-            if check_freshness "$name" "$cache_entry" "0" >/dev/null 2>&1; then
-                status="fresh"
-            else
-                status="stale"
-            fi
-        else
+        # Check if the source container still exists
+        local status="-"
+        if ! podman container inspect "$name" >/dev/null 2>&1; then
             status="orphaned"
         fi
 
