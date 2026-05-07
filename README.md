@@ -24,9 +24,9 @@ in "unsuccessful".
 - [libguestfs-tools](https://libguestfs.org/) (`virt-make-fs`, `virt-customize`)
 - [yq](https://github.com/mikefarah/yq) (only needed if you use a config file)
 
-The toolbox container itself needs a few packages installed:
-`openssh-server`, `systemd-udev`, and `dbus-broker`. schupfn will
-notice if they're missing and offer to install them for you.
+The packages `openssh-server`, `systemd-udev`, and `dbus-broker` are
+required inside the VM and are installed automatically during
+`schupfn create`.
 
 You'll also need SSH public keys in `~/.ssh/id_*.pub` -- that's how
 authentication into the VM works.

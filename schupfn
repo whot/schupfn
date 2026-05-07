@@ -196,53 +196,6 @@ check_nested_export_conflicts() {
     done
 }
 
-# Verify the container has the packages schupfn needs and offer to
-# install any that are missing.
-check_container_prerequisites() {
-    local name="$1"
-    local -a missing=()
-
-    # Mount the container, check all binaries, unmount — in a single
-    # podman unshare call.  Each podman unshare creates a user namespace
-    # so batching saves significant overhead.
-    local check_result
-    check_result=$(podman unshare bash -c '
-        mnt=$(podman mount "$1" 2>/dev/null) || exit 1
-        test -x "$mnt/usr/sbin/sshd" || echo openssh-server
-        test -x "$mnt/usr/lib/systemd/systemd-udevd" || \
-            test -x "$mnt/lib/systemd/systemd-udevd" || echo systemd-udev
-        test -x "$mnt/usr/bin/dbus-broker" || \
-            test -x "$mnt/usr/bin/dbus-daemon" || echo dbus-broker
-        podman unmount "$1" >/dev/null 2>&1
-    ' _ "$name" 2>/dev/null) || die "failed to mount container '$name' for prerequisite check"
-
-    while IFS= read -r pkg; do
-        [ -n "$pkg" ] && missing+=("$pkg")
-    done <<< "$check_result"
-
-    if [ ${#missing[@]} -eq 0 ]; then
-        return
-    fi
-
-    warn "container '$name' is missing required packages: ${missing[*]}"
-    printf "Install them now? [y/N] "
-    read -r answer
-    case "$answer" in
-        y|Y|yes|YES)
-            todo "installing ${missing[*]} in container '$name'..."
-            dnf_msgs=$(mktemp)
-            trap 'rm -f "$dnf_msgs"' RETURN
-            if ! toolbox run -c "$name" sudo dnf -q install -y "${missing[@]}" >/dev/null 2>"$dnf_msgs"; then
-                die "failed to install packages: $(cat "$dnf_msgs")"
-            fi
-            todo_done
-            ;;
-        *)
-            die "cannot continue without: ${missing[*]}"
-            ;;
-    esac
-}
-
 # ── SSH / VM lifecycle ──────────────────────────────────────────────────────
 
 # Find a free port for SSH.
@@ -1151,8 +1104,8 @@ is given.
 
 If <name> is omitted, the 'container' field from the config file is used.
 
-The container must have these packages installed:
-  openssh-server, systemd-udev, dbus-broker
+Required packages (openssh-server, systemd-udev, dbus-broker) are
+installed automatically during image creation.
 
 Options:
   --force           Rebuild the image even if one already exists
@@ -1554,8 +1507,16 @@ export_image() {
         fi
     }
 
+    todo_done
+
     # ── Container-to-VM transition fixes ────────────────────────────────
 
+    local -a required_packages=("openssh-server" "systemd-udev" "dbus-broker")
+    todo "installing required packages: ${required_packages[*]}"
+    _bdnf "${required_packages[@]}"
+    todo_done
+
+    todo "converting from container to VM"
     _brun rm -f /.dockerenv
     _brun rm -f /etc/systemd/system/service.d/00-container.conf
     _brun rm -f /etc/systemd/system.conf.d/00-container.conf
@@ -1568,7 +1529,8 @@ export_image() {
     # SELinux: set to permissive (container labels are wrong for a VM)
     _brun bash -c 'if [ -f /etc/selinux/config ]; then sed -i "s/^SELINUX=.*/SELINUX=permissive/" /etc/selinux/config; fi'
 
-    # Mask problematic systemd units
+    # Mask problematic systemd units, need to do this after
+    # installing our packages (which typically include systemd)
     _brun ln -sf /dev/null /etc/systemd/system/tmp.mount
     _brun bash -c 'mkdir -p /tmp && chmod 1777 /tmp'
 
@@ -1947,9 +1909,6 @@ cmd_create() {
     if ! podman container inspect "$name" >/dev/null 2>&1; then
         die "container '$name' does not exist. Create it with 'toolbox create $name'."
     fi
-
-    # Check that the container has required packages installed
-    check_container_prerequisites "$name"
 
     local cache_dir="$CACHE_DIR/$name"
     local image="$cache_dir/$name.qcow2"
