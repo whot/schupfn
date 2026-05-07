@@ -70,13 +70,12 @@ is omitted, the
 field from the configuration file is used (see
 .BR "CONFIGURATION FILE" ).
 .PP
-The container must have these packages installed:
+The packages
 .BR openssh\-server ,
 .BR systemd\-udev ,
-.BR dbus\-broker .
-If any are missing,
-.B schupfn
-will offer to install them.
+and
+.BR dbus\-broker
+are required and installed automatically during image creation.
 .PP
 If the image already exists, the command exits with an error unless
 .B \-\-force
