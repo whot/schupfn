@@ -1470,14 +1470,14 @@ export_image() {
     # Helper to run commands in the working container
     _brun() { buildah run --env PATH=/usr/sbin:/usr/bin:/sbin:/bin "$wc" -- "$@"; }
 
-    # Helper to write a file into the container from a string
+    # Helper to write a file into the container from stdin
     _bwrite() {
         local dest="$1" mode="${2:-0644}"
         local tmp
         tmp=$(mktemp)
+        trap 'rm -f "$tmp"' RETURN
         cat > "$tmp"
         buildah copy --chmod "$mode" "$wc" "$tmp" "$dest" >/dev/null
-        rm -f "$tmp"
     }
 
     # Helper: run dnf install inside the container, showing any error
@@ -1665,16 +1665,8 @@ SSHD_SVC
 
     # ── 9p mount script + service ───────────────────────────────────────
 
-    local mount_script_tmp mount_service_tmp
-    mount_script_tmp=$(mktemp)
-    mount_service_tmp=$(mktemp)
-    # Ensure temp files are cleaned up on any exit from this function
-    trap 'rm -f "$mount_script_tmp" "$mount_service_tmp"' RETURN
-    generate_mount_script > "$mount_script_tmp"
-    generate_mount_service > "$mount_service_tmp"
-
-    buildah copy --chmod 0755 "$wc" "$mount_script_tmp" /usr/local/bin/schupfn-mounts.sh >/dev/null
-    buildah copy --chmod 0644 "$wc" "$mount_service_tmp" /etc/systemd/system/schupfn-mounts.service >/dev/null
+    generate_mount_script | _bwrite /usr/local/bin/schupfn-mounts.sh 0755
+    generate_mount_service | _bwrite /etc/systemd/system/schupfn-mounts.service 0644
     _brun bash -c 'ln -sf /etc/systemd/system/schupfn-mounts.service /etc/systemd/system/multi-user.target.wants/'
 
     # ── Network script + service ────────────────────────────────────────
