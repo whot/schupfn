@@ -1523,7 +1523,7 @@ export_image() {
     # ── D-Bus ───────────────────────────────────────────────────────────
 
     _brun bash -c 'mkdir -p /etc/systemd/system/multi-user.target.wants /etc/systemd/system/sockets.target.wants'
-    _brun bash -c 'if [ -f /usr/lib/systemd/system/dbus-broker.service ]; then ln -sf /usr/lib/systemd/system/dbus-broker.service /etc/systemd/system/multi-user.target.wants/; else ln -sf /usr/lib/systemd/system/dbus.service /etc/systemd/system/multi-user.target.wants/ 2>/dev/null; fi || true'
+    _brun bash -c 'if [ -f /usr/lib/systemd/system/dbus-broker.service ]; then ln -sf /usr/lib/systemd/system/dbus-broker.service /etc/systemd/system/multi-user.target.wants/; ln -sf /usr/lib/systemd/system/dbus-broker.service /etc/systemd/system/dbus.service; else ln -sf /usr/lib/systemd/system/dbus.service /etc/systemd/system/multi-user.target.wants/ 2>/dev/null; fi || true'
     _brun bash -c 'ln -sf /usr/lib/systemd/system/dbus.socket /etc/systemd/system/sockets.target.wants/ 2>/dev/null || true'
 
     # ── Kernel modules ──────────────────────────────────────────────────
