@@ -1651,49 +1651,21 @@ SSHD_CONF
     generate_mount_service | _bwrite /etc/systemd/system/schupfn-mounts.service 0644
     _brun bash -c 'ln -sf /etc/systemd/system/schupfn-mounts.service /etc/systemd/system/multi-user.target.wants/'
 
-    # ── Network script + service ────────────────────────────────────────
+    # ── Network: let systemd-networkd handle DHCP via QEMU SLIRP ──────
 
-    _bwrite /usr/local/bin/schupfn-network.sh 0755 <<'NETSCRIPT'
-#!/bin/bash
-modprobe virtio_net 2>/dev/null
-# Wait for udev to finish processing device events so the
-# virtio-net interface is fully registered before we look for it.
-udevadm settle --timeout=10 2>/dev/null || true
-for i in $(seq 1 20); do
-    iface=$(ls /sys/class/net/ 2>/dev/null | grep -v lo | head -1)
-    [ -n "$iface" ] && break
-    sleep 0.5
-done
-if [ -z "$iface" ]; then
-    echo "schupfn-network: no network interface found" >&2
-    exit 1
-fi
-ip addr add 10.0.2.15/24 dev "$iface" 2>/dev/null
-ip link set "$iface" up
-ip route add default via 10.0.2.2 dev "$iface" 2>/dev/null
-rm -f /etc/resolv.conf
-echo "nameserver 10.0.2.3" > /etc/resolv.conf
-echo "schupfn-network: configured $iface with 10.0.2.15/24"
-NETSCRIPT
+    _brun bash -c 'mkdir -p /etc/systemd/network'
+    _bwrite /etc/systemd/network/80-schupfn.network 0644 <<'NETCFG'
+[Match]
+Driver=virtio_net
 
-    _bwrite /etc/systemd/system/schupfn-network.service 0644 <<'NETSVC'
-[Unit]
-Description=schupfn network setup
-After=systemd-modules-load.service systemd-udevd.service
-Before=network.target
+[Network]
+DHCP=yes
 
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/usr/local/bin/schupfn-network.sh
-Restart=on-failure
-RestartSec=1
-
-[Install]
-WantedBy=multi-user.target
-NETSVC
-    _brun bash -c 'ln -sf /etc/systemd/system/schupfn-network.service /etc/systemd/system/multi-user.target.wants/'
-    _brun bash -c 'rm -f /etc/systemd/system/multi-user.target.wants/systemd-networkd.service 2>/dev/null || true'
+[DHCPv4]
+UseDNS=no
+NETCFG
+    _brun bash -c 'mkdir -p /etc/systemd/system/multi-user.target.wants'
+    _brun bash -c 'ln -sf /usr/lib/systemd/system/systemd-networkd.service /etc/systemd/system/multi-user.target.wants/'
 
     # ── Hostname ────────────────────────────────────────────────────────
 
