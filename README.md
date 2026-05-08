@@ -17,6 +17,9 @@ underneath.
 shed. That's where you keep your toolboxes. The `u` is pronounced like the `u`
 in "unsuccessful".
 
+Here's a demo showing off all the goodies:
+![Screencast of schupfn's features](.github/assets/demo.svg)
+
 ## Requirements
 
 - [podman](https://podman.io/) and [toolbox](https://containertoolbx.org/)
