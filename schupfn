@@ -1560,48 +1560,30 @@ export_image() {
     # Remove stale host keys and regenerate
     _brun bash -c 'rm -f /etc/ssh/ssh_host_*key* && ssh-keygen -q -A > /dev/null'
 
-    # Disable all stock sshd mechanisms
-    _brun bash -c 'rm -f /etc/systemd/system/multi-user.target.wants/sshd.service 2>/dev/null || true'
-    _brun ln -sf /dev/null /etc/systemd/system/sshd.socket
-    _brun ln -sf /dev/null /etc/systemd/system/sshd@.service
-    _brun bash -c 'mkdir -p /etc/systemd/system-generators && ln -sf /dev/null /etc/systemd/system-generators/systemd-ssh-generator'
-
-    # Write our minimal sshd config
-    _bwrite /etc/ssh/sshd_config_schupfn 0644 <<'SSHD_CONF'
-Port 22
-PermitRootLogin prohibit-password
-PubkeyAuthentication yes
-PubkeyAcceptedAlgorithms +ssh-rsa
-AuthorizedKeysFile .ssh/authorized_keys
-PasswordAuthentication no
+    # Drop-in sshd config for the VM environment
+    _brun mkdir -p /etc/ssh/sshd_config.d
+    _bwrite /etc/ssh/sshd_config.d/50-schupfn.conf 0644 <<'SSHD_CONF'
+# Disable PAM — we manage accounts directly and PAM modules
+# can reject auth for accounts it considers locked
 UsePAM no
-UseDNS no
+# Disable password auth — key-only access
+PasswordAuthentication no
+PermitRootLogin prohibit-password
+# Avoid GSSAPI delays
 GSSAPIAuthentication no
-X11Forwarding no
-PrintMotd no
-PerSourcePenaltyExemptList 10.0.2.2
+# Allow older RSA keys
+PubkeyAcceptedAlgorithms +ssh-rsa
+# Pass locale environment
 AcceptEnv LANG LC_*
-Subsystem sftp /usr/libexec/openssh/sftp-server
+# Exempt the QEMU SLIRP gateway from per-source penalties —
+# early connections during boot can trigger escalating delays
+PerSourcePenaltyExemptList 10.0.2.2
 SSHD_CONF
 
-    # Write the schupfn-sshd systemd service
-    _bwrite /etc/systemd/system/schupfn-sshd.service 0644 <<'SSHD_SVC'
-[Unit]
-Description=schupfn SSH server
-After=network.target sshd-keygen.target schupfn-network.service schupfn-mounts.service
-Wants=sshd-keygen.target schupfn-mounts.service
-
-[Service]
-ExecStart=/usr/sbin/sshd -D -f /etc/ssh/sshd_config_schupfn -e
-Restart=on-failure
-RestartSec=1
-
-[Install]
-WantedBy=multi-user.target
-SSHD_SVC
-    # Enable services by creating symlinks directly (systemctl needs
-    # D-Bus which isn't running inside a buildah container)
-    _brun bash -c 'mkdir -p /etc/systemd/system/multi-user.target.wants && ln -sf /etc/systemd/system/schupfn-sshd.service /etc/systemd/system/multi-user.target.wants/'
+    # Enable socket-activated sshd — no need for ordering dependencies
+    # since sshd only spawns when a connection arrives, by which time
+    # the network and mounts are already up.
+    _brun bash -c 'mkdir -p /etc/systemd/system/sockets.target.wants && ln -sf /usr/lib/systemd/system/sshd.socket /etc/systemd/system/sockets.target.wants/'
 
     todo_done
 
@@ -1698,7 +1680,7 @@ NETSCRIPT
 [Unit]
 Description=schupfn network setup
 After=systemd-modules-load.service systemd-udevd.service
-Before=network.target schupfn-sshd.service
+Before=network.target
 
 [Service]
 Type=oneshot
