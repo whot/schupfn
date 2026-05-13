@@ -2089,7 +2089,9 @@ cmd_enter() {
                 # Check if it's already covered by an existing mount
                 local already_exported=0
                 for d in "${rw_mount_dirs[@]}" "${ro_mount_dirs[@]}" "${cow_mount_dirs[@]}"; do
-                    if [[ "$resolved_git_dir" = "$d" ]] || [[ "$resolved_git_dir" = "$d/"* ]]; then
+                    local prefix="$d"
+                    [[ "$prefix" != "/" ]] && prefix+="/"
+                    if [[ "$resolved_git_dir" = "$d" ]] || [[ "$resolved_git_dir" = "$prefix"* ]]; then
                         already_exported=1
                         break
                     fi
@@ -2326,7 +2328,9 @@ cmd_start() {
             if [ -n "$resolved_git_dir" ] && [ -d "$resolved_git_dir" ]; then
                 local already_exported=0
                 for d in "${rw_mount_dirs[@]}" "${ro_mount_dirs[@]}" "${cow_mount_dirs[@]}"; do
-                    if [[ "$resolved_git_dir" = "$d" ]] || [[ "$resolved_git_dir" = "$d/"* ]]; then
+                    local prefix="$d"
+                    [[ "$prefix" != "/" ]] && prefix+="/"
+                    if [[ "$resolved_git_dir" = "$d" ]] || [[ "$resolved_git_dir" = "$prefix"* ]]; then
                         already_exported=1
                         break
                     fi
