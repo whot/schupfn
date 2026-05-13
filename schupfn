@@ -196,6 +196,41 @@ check_nested_export_conflicts() {
     done
 }
 
+# Check whether $physical_pwd is already covered by an --export-* path.
+# If it is (equal to or a subdirectory of an exported directory), echo
+# the mode of that export and return 0.  Otherwise return 1.
+#
+# These arrays must exist in the caller's scope:
+#   rw_mount_dirs, ro_mount_dirs, cow_mount_dirs
+pwd_covered_by_export() {
+    local pwd_path="$1"
+    local d prefix
+
+    for d in "${rw_mount_dirs[@]}"; do
+        prefix="$d"
+        [[ "$prefix" != "/" ]] && prefix+="/"
+        if [[ "$pwd_path" = "$d" ]] || [[ "$pwd_path" = "$prefix"* ]]; then
+            echo "rw"; return 0
+        fi
+    done
+    for d in "${ro_mount_dirs[@]}"; do
+        prefix="$d"
+        [[ "$prefix" != "/" ]] && prefix+="/"
+        if [[ "$pwd_path" = "$d" ]] || [[ "$pwd_path" = "$prefix"* ]]; then
+            echo "ro"; return 0
+        fi
+    done
+    for d in "${cow_mount_dirs[@]}"; do
+        prefix="$d"
+        [[ "$prefix" != "/" ]] && prefix+="/"
+        if [[ "$pwd_path" = "$d" ]] || [[ "$pwd_path" = "$prefix"* ]]; then
+            echo "cow"; return 0
+        fi
+    done
+
+    return 1
+}
+
 # ── SSH / VM lifecycle ──────────────────────────────────────────────────────
 
 # Find a free port for SSH.
@@ -1022,8 +1057,9 @@ usage_enter() {
     cat <<EOF
 Usage: $PROGNAME enter [<name>] [options]
 
-Boot a previously created VM image and connect to it via SSH. The current
-directory is mounted read-write inside the VM.
+Boot a previously created VM image and connect to it via SSH.
+The current directory is mounted read-write inside the VM unless explicitly
+mounted as --export-ro/cow.
 
 The image must already exist; run '$PROGNAME create <name>' first to
 export the container to a disk image.
@@ -1126,6 +1162,10 @@ Usage: $PROGNAME start [<name>] [options]
 
 Start a VM in the background from a previously created image. The VM
 keeps running until explicitly stopped with '$PROGNAME stop'.
+
+If the current directory is inside one of the --export-* paths, it
+inherits that path's export mode.  Otherwise it is automatically
+exported read-write.
 
 Use '$PROGNAME join' to connect to the running VM.
 
@@ -2052,16 +2092,11 @@ cmd_enter() {
     fi
 
     # Classify each export path as a directory or file.
-    local -a rw_mount_dirs=("$physical_pwd")   # $PWD is always read-write
+    local -a rw_mount_dirs=()
     local -a ro_mount_dirs=()
     local -a cow_mount_dirs=()
     local -a rootfs_symlinks=()
     local -a dotfiles=()
-
-    # If $PWD is (or passes through) a symlink, remember the mapping
-    if [ "$PWD" != "$physical_pwd" ]; then
-        rootfs_symlinks+=("$PWD:$physical_pwd")
-    fi
 
     for path in "${exports[@]}"; do
         classify_export "$path" "ro"
@@ -2072,6 +2107,18 @@ cmd_enter() {
     for path in "${exports_cow[@]}"; do
         classify_export "$path" "cow"
     done
+
+    # If $PWD is already inside an exported path, it inherits that
+    # export's mode and no extra mount is needed.  Otherwise, export
+    # $PWD read-write (the default).
+    if ! pwd_covered_by_export "$physical_pwd" >/dev/null; then
+        rw_mount_dirs+=("$physical_pwd")
+    fi
+
+    # If $PWD is (or passes through) a symlink, remember the mapping
+    if [ "$PWD" != "$physical_pwd" ]; then
+        rootfs_symlinks+=("$PWD:$physical_pwd")
+    fi
 
     # If --follow-git-worktrees is set and $PWD is a git worktree,
     # automatically export the git common directory (the main .git dir)
@@ -2297,15 +2344,11 @@ cmd_start() {
     fi
 
     # Classify each export path
-    local -a rw_mount_dirs=("$physical_pwd")
+    local -a rw_mount_dirs=()
     local -a ro_mount_dirs=()
     local -a cow_mount_dirs=()
     local -a rootfs_symlinks=()
     local -a dotfiles=()
-
-    if [ "$PWD" != "$physical_pwd" ]; then
-        rootfs_symlinks+=("$PWD:$physical_pwd")
-    fi
 
     for path in "${exports[@]}"; do
         classify_export "$path" "ro"
@@ -2316,6 +2359,18 @@ cmd_start() {
     for path in "${exports_cow[@]}"; do
         classify_export "$path" "cow"
     done
+
+    # If $PWD is already inside an exported path, it inherits that
+    # export's mode and no extra mount is needed.  Otherwise, export
+    # $PWD read-write (the default).
+    if ! pwd_covered_by_export "$physical_pwd" >/dev/null; then
+        rw_mount_dirs+=("$physical_pwd")
+    fi
+
+    # If $PWD is (or passes through) a symlink, remember the mapping
+    if [ "$PWD" != "$physical_pwd" ]; then
+        rootfs_symlinks+=("$PWD:$physical_pwd")
+    fi
 
     if [ "$follow_git_worktrees" = "1" ]; then
         local git_common_dir
