@@ -259,3 +259,81 @@ teardown() {
     check_nested_export_conflicts || true
     assert_die_not_called
 }
+
+# ── pwd_covered_by_export ────────────────────────────────────────────────
+
+@test "pwd_covered_by_export: pwd matches rw export exactly" {
+    mkdir -p "$TMPDIR/mydir"
+    rw_mount_dirs=("$(realpath "$TMPDIR/mydir")")
+
+    local mode
+    mode=$(pwd_covered_by_export "$(realpath "$TMPDIR/mydir")")
+    [ "$mode" = "rw" ]
+}
+
+@test "pwd_covered_by_export: pwd matches ro export exactly" {
+    mkdir -p "$TMPDIR/mydir"
+    ro_mount_dirs=("$(realpath "$TMPDIR/mydir")")
+
+    local mode
+    mode=$(pwd_covered_by_export "$(realpath "$TMPDIR/mydir")")
+    [ "$mode" = "ro" ]
+}
+
+@test "pwd_covered_by_export: pwd matches cow export exactly" {
+    mkdir -p "$TMPDIR/mydir"
+    cow_mount_dirs=("$(realpath "$TMPDIR/mydir")")
+
+    local mode
+    mode=$(pwd_covered_by_export "$(realpath "$TMPDIR/mydir")")
+    [ "$mode" = "cow" ]
+}
+
+@test "pwd_covered_by_export: pwd is subdirectory of rw export" {
+    mkdir -p "$TMPDIR/parent/child"
+    rw_mount_dirs=("$(realpath "$TMPDIR/parent")")
+
+    local mode
+    mode=$(pwd_covered_by_export "$(realpath "$TMPDIR/parent/child")")
+    [ "$mode" = "rw" ]
+}
+
+@test "pwd_covered_by_export: pwd is subdirectory of ro export" {
+    mkdir -p "$TMPDIR/parent/child"
+    ro_mount_dirs=("$(realpath "$TMPDIR/parent")")
+
+    local mode
+    mode=$(pwd_covered_by_export "$(realpath "$TMPDIR/parent/child")")
+    [ "$mode" = "ro" ]
+}
+
+@test "pwd_covered_by_export: pwd is not inside any export" {
+    mkdir -p "$TMPDIR/exported" "$TMPDIR/elsewhere"
+    rw_mount_dirs=("$(realpath "$TMPDIR/exported")")
+
+    run pwd_covered_by_export "$(realpath "$TMPDIR/elsewhere")"
+    [ "$status" -eq 1 ]
+}
+
+@test "pwd_covered_by_export: similarly named dir is not a match" {
+    mkdir -p "$TMPDIR/foobar" "$TMPDIR/foo"
+    rw_mount_dirs=("$(realpath "$TMPDIR/foo")")
+
+    run pwd_covered_by_export "$(realpath "$TMPDIR/foobar")"
+    [ "$status" -eq 1 ]
+}
+
+@test "pwd_covered_by_export: no exports returns failure" {
+    mkdir -p "$TMPDIR/mydir"
+
+    run pwd_covered_by_export "$(realpath "$TMPDIR/mydir")"
+    [ "$status" -eq 1 ]
+}
+
+@test "pwd_covered_by_export: root export covers everything" {
+    rw_mount_dirs=("/")
+
+    local mode
+    mode=$(pwd_covered_by_export "/some/deep/path")
+    [ "$mode" = "rw" ]
+}
