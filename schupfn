@@ -2011,7 +2011,7 @@ cmd_enter() {
 
     # Scalars: CLI wins, then config, then built-in default
     memory="${cli_memory:-${_cfg_memory:-4G}}"
-    cpus="${cli_cpus:-${_cfg_cpus}}"
+    cpus="${cli_cpus:-${_cfg_cpus:-$(nproc)}}"
     network="${cli_network:-${_cfg_network:-1}}"
     local display="${cli_display:-${_cfg_display}}"
     if [ "$follow_git_worktrees" != "1" ] && [ "${_cfg_follow_git_worktrees}" = "1" ]; then
@@ -2267,7 +2267,7 @@ cmd_start() {
 
     # Scalars: CLI wins, then config, then built-in default
     memory="${cli_memory:-${_cfg_memory:-4G}}"
-    cpus="${cli_cpus:-${_cfg_cpus}}"
+    cpus="${cli_cpus:-${_cfg_cpus:-$(nproc)}}"
     network="${cli_network:-${_cfg_network:-1}}"
     local display="${cli_display:-${_cfg_display}}"
     if [ "$follow_git_worktrees" != "1" ] && [ "${_cfg_follow_git_worktrees}" = "1" ]; then
