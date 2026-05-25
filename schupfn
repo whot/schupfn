@@ -1504,6 +1504,9 @@ export_image() {
 
     todo "converting from container to VM"
     _brun rm -f /.dockerenv
+    # /run/.containerenv and /run/.toolboxenv are removed later via
+    # virt-customize because they live on a tmpfs inside the buildah
+    # container and cannot be removed with buildah run.
     _brun rm -f /etc/systemd/system/service.d/00-container.conf
     _brun rm -f /etc/systemd/system.conf.d/00-container.conf
     _brun bash -c 'sed -i "/^container=/d" /etc/environment 2>/dev/null || true'
@@ -1751,7 +1754,8 @@ NETCFG
     if ! virt-customize -q -a "$image" --no-network --no-selinux-relabel \
             --run-command 'chown -R root:root /etc' \
             --run-command 'rpm --setperms -a 2>/dev/null || true' \
-            --run-command 'rpm --setugids -a 2>/dev/null || true'; then
+            --run-command 'rpm --setugids -a 2>/dev/null || true' \
+            --run-command 'rm -f /run/.containerenv /run/.toolboxenv'; then
         die "failed to fix image permissions"
     fi
 
