@@ -394,16 +394,13 @@ cleanup_vm() {
 #
 # Does NOT set EXIT traps — the caller decides on cleanup behavior.
 _boot_vm() {
-    # Find the host kernel and initramfs
-    local kernel initramfs
-    kernel=$(find_host_kernel)
-    initramfs=$(find_host_initramfs)
-    info "using kernel: $kernel"
-    if [ -n "$initramfs" ]; then
-        info "using initramfs: $initramfs"
-    else
-        info "no readable initramfs found (booting without one)"
+    # Use the kernel extracted from the image during create.
+    local kernel="$cache_dir/vmlinuz"
+    if [ ! -f "$kernel" ]; then
+        die "no vmlinuz found for image '$name'." \
+            "Rebuild the image with '$PROGNAME create $name --force'."
     fi
+    info "using kernel: $kernel"
 
     # Pick a port for SSH
     ssh_port=$(find_free_port)
@@ -466,10 +463,6 @@ _boot_vm() {
         -kernel "$kernel"
         -drive "file=$session_image,format=qcow2,if=virtio"
     )
-
-    if [ -n "$initramfs" ]; then
-        qemu_cmd+=(-initrd "$initramfs")
-    fi
 
     # Display adapter
     if [ -n "$display" ]; then
@@ -535,15 +528,6 @@ _boot_vm() {
         fs_idx=$((fs_idx + 1))
         todo_done
     done
-
-    # Mount host kernel modules so the VM can load them
-    local kver
-    kver=$(uname -r)
-    if [ -d "/lib/modules/$kver" ]; then
-        local tag="schupfn_kmod"
-        qemu_cmd+=(-virtfs "local,path=/lib/modules/$kver,mount_tag=$tag,security_model=none,id=fskmod,readonly=on")
-        kernel_args+=("schupfn.9p=${tag}:/lib/modules/${kver}:ro")
-    fi
 
     # Assemble kernel command line
     local kernel_cmdline=""
@@ -1224,92 +1208,6 @@ read_meta() {
     return 0
 }
 
-# ── Host kernel/initramfs detection ─────────────────────────────────────────
-
-# Locate the kernel image for the running kernel.
-# The file must be readable by the current user.
-find_host_kernel() {
-    local kver
-    kver=$(uname -r)
-    local -a candidates=(
-        "/lib/modules/$kver/vmlinuz"
-        "/boot/vmlinuz-$kver"
-        "/boot/vmlinuz"
-    )
-    for path in "${candidates[@]}"; do
-        if [ -r "$path" ]; then
-            echo "$path"
-            return 0
-        fi
-    done
-    die "cannot find a readable kernel image for $kver." \
-        "Looked in: ${candidates[*]}" \
-        "On Fedora, /boot files are often root-only;" \
-        "/lib/modules/$kver/vmlinuz is typically world-readable."
-}
-
-# Locate the initramfs for the running kernel.
-# Returns the path if found and readable, or empty string if none is
-# available. An initramfs is optional when the kernel has virtio_blk,
-# virtio_pci, and the root filesystem driver (ext4) built in — which
-# is the case on Fedora and most distribution kernels.
-find_host_initramfs() {
-    local kver
-    kver=$(uname -r)
-    local -a candidates=(
-        "/boot/initramfs-$kver.img"
-        "/boot/initrd.img-$kver"
-        "/boot/initrd-$kver.img"
-        "/boot/initrd-$kver"
-        "/boot/initramfs.img"
-    )
-    for path in "${candidates[@]}"; do
-        if [ -r "$path" ]; then
-            echo "$path"
-            return 0
-        fi
-    done
-    # Not found — caller decides whether this is fatal
-    return 0
-}
-
-# Check that the image's kernel modules match the running kernel.
-# The image includes modules for the kernel that was running at create
-# time.  If the host kernel has been updated since then, critical modules
-# (virtio_net, 9p) cannot be loaded and the VM will have no networking
-# or host mounts.
-#
-# $1 = cache_dir, $2 = container name
-check_kernel_mismatch() {
-    local cache_dir="$1"
-    local name="$2"
-    local image="$cache_dir/$name.qcow2"
-    local kver
-    kver=$(uname -r)
-
-    # The image stores modules under /lib/modules/<kver>/.  Use
-    # virt-ls to list the directories under /lib/modules/ and check
-    # whether the current kernel version is present.
-    if ! command -v virt-ls >/dev/null 2>&1; then
-        return 0  # can't check without virt-ls
-    fi
-
-    local image_kvers
-    image_kvers=$(virt-ls -a "$image" /lib/modules/ 2>/dev/null) || return 0
-
-    if [ -z "$image_kvers" ]; then
-        return 0  # no modules directory — can't tell
-    fi
-
-    if ! echo "$image_kvers" | grep -qxF "$kver"; then
-        local image_kver
-        image_kver=$(echo "$image_kvers" | head -1)
-        die "kernel mismatch: image '$name' contains modules for $image_kver" \
-            "but the running kernel is $kver." \
-            "Rebuild the image with '$PROGNAME create $name --force'."
-    fi
-}
-
 # ── Export ───────────────────────────────────────────────────────────────────
 
 # Build the guest-side systemd service unit that mounts 9p shares.
@@ -1317,15 +1215,9 @@ check_kernel_mismatch() {
 # entries and mounts each one.
 #
 # The 9p kernel modules (9p, 9pnet, 9pnet_virtio) must be loaded before
-# any 9p mount can succeed.  We handle this by loading them via modprobe
-# first — this works because:
-#   - If the modules are built-in: modprobe succeeds silently
-#   - If the modules are loadable: we need /lib/modules to be mounted,
-#     but /lib/modules is itself a 9p mount (circular dependency).
-#     To break the circle, the host kernel modules directory is passed
-#     as a kernel built-in 9p mount tag.  We mount that first using
-#     insmod on the module files from the disk image (which were
-#     installed by virt-customize), then modprobe works for everything.
+# any 9p mount can succeed.  The image includes a full kernel (installed
+# via kernel-core during create), so modprobe works directly against the
+# image's own /lib/modules.
 generate_mount_script() {
     cat <<'SCRIPT'
 #!/bin/bash
@@ -1478,9 +1370,6 @@ export_image() {
     host_tz=$(timedatectl show -p Timezone --value 2>/dev/null \
         || cat /etc/timezone 2>/dev/null || echo "UTC")
 
-    local kver
-    kver=$(uname -r)
-
     # ── Phase 1: prepare the container with buildah ─────────────────────
     #
     # Use buildah to create a working container from the toolbox
@@ -1534,7 +1423,7 @@ export_image() {
 
     # ── Container-to-VM transition fixes ────────────────────────────────
 
-    local -a required_packages=("openssh-server" "systemd-udev" "dbus-broker")
+    local -a required_packages=("openssh-server" "systemd-udev" "dbus-broker" "kernel-core")
     todo "installing required packages: ${required_packages[*]}"
     _bdnf "${required_packages[@]}"
     todo_done
@@ -1567,31 +1456,9 @@ export_image() {
     _brun bash -c 'ln -sf /usr/lib/systemd/system/dbus.socket /etc/systemd/system/sockets.target.wants/ 2>/dev/null || true'
 
     # ── Kernel modules ──────────────────────────────────────────────────
-
-    local host_moddir="/lib/modules/$kver"
-    if [ -d "$host_moddir" ]; then
-        local mod_tar
-        mod_tar=$(mktemp --suffix=.tar)
-        local -a mod_files=()
-        while IFS= read -r line; do
-            local mod_path="${line#insmod }"
-            mod_path="${mod_path%%[[:space:]]*}"
-            [ -f "$mod_path" ] && mod_files+=("${mod_path#/}")
-        done < <(modprobe --show-depends 9pnet_virtio 2>/dev/null; \
-                 modprobe --show-depends 9p 2>/dev/null; \
-                 modprobe --show-depends virtio_net 2>/dev/null; \
-                 modprobe --show-depends overlay 2>/dev/null)
-
-        if [ ${#mod_files[@]} -gt 0 ]; then
-            tar -cf "$mod_tar" -C / "${mod_files[@]}" 2>/dev/null
-            buildah copy "$wc" "$mod_tar" /tmp/schupfn-modules.tar >/dev/null
-            rm -f "$mod_tar"
-            _brun bash -c 'tar -xf /tmp/schupfn-modules.tar -C / && rm -f /tmp/schupfn-modules.tar'
-            _brun /usr/sbin/depmod -a "$kver" 2>/dev/null || true
-        else
-            rm -f "$mod_tar"
-        fi
-    fi
+    # kernel-core is installed as a required package above, so the image
+    # already has a full set of matching modules.  We just need to
+    # ensure the critical ones are loaded at boot.
 
     _brun bash -c 'mkdir -p /etc/modules-load.d && printf "virtio_net\noverlay\n" > /etc/modules-load.d/schupfn.conf'
 
@@ -1794,6 +1661,29 @@ NETCFG
             --run-command 'rpm --setugids -a 2>/dev/null || true' \
             --run-command 'rm -f /run/.containerenv /run/.toolboxenv'; then
         die "failed to fix image permissions"
+    fi
+
+    # ── Phase 4: extract vmlinuz ─────────────────────────────────────────
+    #
+    # qemu's -kernel flag requires a vmlinuz on the host filesystem.
+    # Extract it from the image so it's available at boot time without
+    # needing to inspect the qcow2 on every start.
+    todo_done
+    todo "extracting kernel..."
+
+    local vmlinuz="$cache_dir/vmlinuz"
+    rm -f "$vmlinuz"
+    local image_kver
+    image_kver=$(virt-ls -a "$image" /lib/modules/ 2>/dev/null | head -1)
+    if [ -z "$image_kver" ]; then
+        die "no kernel modules found in image — kernel-core may not have been installed"
+    fi
+    if ! virt-cat -a "$image" "/lib/modules/$image_kver/vmlinuz" > "$vmlinuz" 2>/dev/null; then
+        # Fallback: try /boot/vmlinuz-<kver>
+        if ! virt-cat -a "$image" "/boot/vmlinuz-$image_kver" > "$vmlinuz" 2>/dev/null; then
+            rm -f "$vmlinuz"
+            die "cannot find vmlinuz for kernel $image_kver in the image"
+        fi
     fi
 
     todo_done
@@ -2074,8 +1964,6 @@ cmd_enter() {
         die "no image found for '$name'. Run '$PROGNAME create $name' first."
     fi
 
-    check_kernel_mismatch "$cache_dir" "$name"
-
     # Resolve $PWD to its physical path so the 9p mount uses a real
     # directory, not a symlink. Keep the logical path so the user lands
     # in the expected directory.
@@ -2326,8 +2214,6 @@ cmd_start() {
     if [ ! -f "$image" ]; then
         die "no image found for '$name'. Run '$PROGNAME create $name' first."
     fi
-
-    check_kernel_mismatch "$cache_dir" "$name"
 
     # Resolve $PWD to its physical path
     local physical_pwd
