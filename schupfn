@@ -1273,6 +1273,43 @@ find_host_initramfs() {
     return 0
 }
 
+# Check that the image's kernel modules match the running kernel.
+# The image includes modules for the kernel that was running at create
+# time.  If the host kernel has been updated since then, critical modules
+# (virtio_net, 9p) cannot be loaded and the VM will have no networking
+# or host mounts.
+#
+# $1 = cache_dir, $2 = container name
+check_kernel_mismatch() {
+    local cache_dir="$1"
+    local name="$2"
+    local image="$cache_dir/$name.qcow2"
+    local kver
+    kver=$(uname -r)
+
+    # The image stores modules under /lib/modules/<kver>/.  Use
+    # virt-ls to list the directories under /lib/modules/ and check
+    # whether the current kernel version is present.
+    if ! command -v virt-ls >/dev/null 2>&1; then
+        return 0  # can't check without virt-ls
+    fi
+
+    local image_kvers
+    image_kvers=$(virt-ls -a "$image" /lib/modules/ 2>/dev/null) || return 0
+
+    if [ -z "$image_kvers" ]; then
+        return 0  # no modules directory — can't tell
+    fi
+
+    if ! echo "$image_kvers" | grep -qxF "$kver"; then
+        local image_kver
+        image_kver=$(echo "$image_kvers" | head -1)
+        die "kernel mismatch: image '$name' contains modules for $image_kver" \
+            "but the running kernel is $kver." \
+            "Rebuild the image with '$PROGNAME create $name --force'."
+    fi
+}
+
 # ── Export ───────────────────────────────────────────────────────────────────
 
 # Build the guest-side systemd service unit that mounts 9p shares.
@@ -2037,6 +2074,8 @@ cmd_enter() {
         die "no image found for '$name'. Run '$PROGNAME create $name' first."
     fi
 
+    check_kernel_mismatch "$cache_dir" "$name"
+
     # Resolve $PWD to its physical path so the 9p mount uses a real
     # directory, not a symlink. Keep the logical path so the user lands
     # in the expected directory.
@@ -2287,6 +2326,8 @@ cmd_start() {
     if [ ! -f "$image" ]; then
         die "no image found for '$name'. Run '$PROGNAME create $name' first."
     fi
+
+    check_kernel_mismatch "$cache_dir" "$name"
 
     # Resolve $PWD to its physical path
     local physical_pwd
