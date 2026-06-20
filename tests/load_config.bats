@@ -146,6 +146,15 @@ EOF
     [ -z "$_cfg_follow_git_worktrees" ]
 }
 
+@test "load_config: pwd key warns as unknown" {
+    yq_or_skip
+    cat > "$TMPDIR/config.yml" <<'EOF'
+pwd: ro
+EOF
+    run load_config "$TMPDIR/config.yml"
+    [[ "$output" == *"unknown config key"* ]]
+}
+
 @test "load_config: parses image.size" {
     yq_or_skip
     cat > "$TMPDIR/config.yml" <<'EOF'
