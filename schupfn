@@ -219,8 +219,6 @@ wait_for_ssh() {
     local port="$1"
     shift
     local -a keys=("$@")
-    local timeout=30
-    local elapsed=0
 
     # Build -i flags for all provided keys
     local -a key_flags=()
@@ -230,62 +228,55 @@ wait_for_ssh() {
 
     todo "waiting for VM to boot..."
 
-    # Initial delay: qemu's SLIRP stack accepts TCP connections on the
-    # hostfwd port immediately (before the guest has networking), but
-    # can't forward data until the guest's virtio-net is up.  Early
-    # connections get stuck in SLIRP's backlog and never complete the
-    # SSH handshake.  A too-short delay causes spurious connections
-    # that trigger OpenSSH's per-source penalty system, making
-    # subsequent attempts even slower.
-    sleep 5
-    elapsed=5
-
-    while [ "$elapsed" -lt "$timeout" ]; do
-        # Check that the background VM process is still alive
+    # Wait for guest readiness by watching the serial log.  QEMU's
+    # SLIRP stack accepts TCP connections on the hostfwd port
+    # immediately (before the guest has networking).  Probing SSH
+    # before the guest is ready creates stuck connections in SLIRP
+    # that never complete the handshake.  Instead, watch the serial
+    # log for sshd startup, then probe.
+    local boot_deadline=$((SECONDS + 30))
+    while [ "$SECONDS" -lt "$boot_deadline" ]; do
         if [ -n "${QEMU_PID:-}" ] && ! kill -0 "$QEMU_PID" 2>/dev/null; then
-            # Show qemu log if available to help diagnose the failure
-            if [ -n "${QEMU_LOG:-}" ] && [ -f "$QEMU_LOG" ] && [ -s "$QEMU_LOG" ]; then
-                warn "qemu output:"
-                sed 's/^/  /' "$QEMU_LOG" >&2
-            fi
-            die "VM process exited before SSH became available"
+            break
         fi
-
-        if ssh -4 -F /dev/null \
-               -o BatchMode=yes \
-               -o ConnectTimeout=3 \
-               -o ServerAliveInterval=2 \
-               -o ServerAliveCountMax=1 \
-               -o StrictHostKeyChecking=no \
-               -o UserKnownHostsFile=/dev/null \
-               -o IdentitiesOnly=yes \
-               -o ControlPath=none \
-               -o PubkeyAcceptedAlgorithms=+ssh-rsa \
-               -o LogLevel=ERROR \
-               "${key_flags[@]}" \
-               -p "$port" \
-               127.0.0.1 true >/dev/null 2>&1; then
-            todo_done
-            return 0
+        if grep -q -m 1 'schupfn-ready' "$serial_log" 2>/dev/null; then
+            break
         fi
-
-        sleep 1
-        elapsed=$((elapsed + 1))
+        sleep 0.5
     done
 
-    # Show SSH debug output to help diagnose the failure
-    warn "SSH connection failed. Debug output:"
-    ssh -4 -F /dev/null -v -o BatchMode=yes \
-        -o ConnectTimeout=5 \
-        -o StrictHostKeyChecking=no \
-        -o UserKnownHostsFile=/dev/null \
-        -o IdentitiesOnly=yes \
-        -o ControlPath=none \
-        -o PubkeyAcceptedAlgorithms=+ssh-rsa \
-        "${key_flags[@]}" \
-        -p "$port" \
-        127.0.0.1 true 2>&1 | sed 's/^/  /' >&2
-    die "timed out waiting for SSH (${timeout}s). Keys: ${keys[*]}"
+    # Quick banner check: if SLIRP can't forward data after the
+    # guest signals ready, it won't recover — caller should restart.
+    local banner
+    banner=$(timeout 3 bash -c \
+        "read -t 3 line < /dev/tcp/127.0.0.1/$port && echo \$line" \
+        2>/dev/null) || true
+    if [[ "$banner" != SSH-* ]]; then
+        echo ""
+        return 1
+    fi
+
+    # Banner received — SLIRP data path is working, do full SSH
+    if timeout 5 ssh -4 -F /dev/null \
+           -o BatchMode=yes \
+           -o ConnectTimeout=5 \
+           -o ServerAliveInterval=2 \
+           -o ServerAliveCountMax=1 \
+           -o StrictHostKeyChecking=no \
+           -o UserKnownHostsFile=/dev/null \
+           -o IdentitiesOnly=yes \
+           -o ControlPath=none \
+           -o PubkeyAcceptedAlgorithms=+ssh-rsa \
+           -o LogLevel=ERROR \
+           "${key_flags[@]}" \
+           -p "$port" \
+           127.0.0.1 true >/dev/null 2>&1; then
+        todo_done
+        return 0
+    fi
+
+    echo ""
+    return 1
 }
 
 # Collect all PIDs in the process tree rooted at $1 (depth-first).
@@ -402,9 +393,6 @@ _boot_vm() {
     fi
     info "using kernel: $kernel"
 
-    # Pick a port for SSH
-    ssh_port=$(find_free_port)
-
     # Use the image's dedicated SSH key for connecting.
     local image_key="$cache_dir/ssh_key"
     if [ ! -f "$image_key" ]; then
@@ -487,17 +475,14 @@ _boot_vm() {
         qemu_cmd+=(-smp "$cpus")
     fi
 
-    # Networking: user-mode (SLIRP) with SSH port forwarding.
+    # Networking args are added per-attempt in the retry loop below
+    # (the SSH port changes on each retry).
+    local -a netdev_args=()
+    local netdev_base
     if [ "$network" = "1" ]; then
-        qemu_cmd+=(
-            -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:${ssh_port}-:22"
-            -device "virtio-net-pci,netdev=net0"
-        )
+        netdev_base="user,id=net0"
     else
-        qemu_cmd+=(
-            -netdev "user,id=net0,restrict=on,hostfwd=tcp:127.0.0.1:${ssh_port}-:22"
-            -device "virtio-net-pci,netdev=net0"
-        )
+        netdev_base="user,id=net0,restrict=on"
     fi
 
     # Mount directories into the VM via 9p at their original paths.
@@ -543,34 +528,59 @@ _boot_vm() {
         exit 0
     fi
 
-    # Start qemu in the background
-    todo "starting VM '$name' (ssh port $ssh_port)..."
+    # Start qemu and wait for SSH.  SLIRP's data path is
+    # intermittently broken at startup — it listens but can't forward.
+    # Detect this quickly via a banner check and restart QEMU with a
+    # fresh port.
+    local max_attempts=3
+    local attempt
+    for attempt in $(seq 1 "$max_attempts"); do
+        ssh_port=$(find_free_port)
+        netdev_args=(-netdev "${netdev_base},hostfwd=tcp:127.0.0.1:${ssh_port}-:22"
+                     -device "virtio-net-pci,netdev=net0")
 
-    local qemu_log="$cache_dir/qemu.log"
-    QEMU_LOG="$qemu_log"
-    : > "$serial_log"  # truncate/create so tail -f doesn't fail
-    "${qemu_cmd[@]}" </dev/null >"$qemu_log" 2>&1 &
-    QEMU_PID=$!
-    SESSION_NAME="$name"
+        if [ "$attempt" -eq 1 ]; then
+            todo "starting VM '$name' (ssh port $ssh_port)..."
+        else
+            todo "starting VM '$name' (ssh port $ssh_port, attempt $attempt)..."
+        fi
 
-    # In verbose mode, tail the serial console log on stderr so the
-    # user can see boot progress.  Kill the tail once SSH is up.
-    local tail_pid=""
-    if [ "$verbose" = "1" ]; then
-        tail -f "$serial_log" >&2 &
-        tail_pid=$!
-    fi
+        local qemu_log="$cache_dir/qemu.log"
+        QEMU_LOG="$qemu_log"
+        : > "$serial_log"  # truncate/create so tail -f doesn't fail
+        "${qemu_cmd[@]}" "${netdev_args[@]}" </dev/null >"$qemu_log" 2>&1 &
+        QEMU_PID=$!
+        SESSION_NAME="$name"
 
-    todo_done
+        local tail_pid=""
+        if [ "$verbose" = "1" ]; then
+            tail -f "$serial_log" >&2 &
+            tail_pid=$!
+        fi
 
-    # Wait for SSH to become available
-    wait_for_ssh "$ssh_port" "$image_key"
+        todo_done
 
-    # Stop tailing serial log
-    if [ -n "$tail_pid" ]; then
-        kill "$tail_pid" 2>/dev/null
-        wait "$tail_pid" 2>/dev/null
-    fi
+        if wait_for_ssh "$ssh_port" "$image_key"; then
+            if [ -n "$tail_pid" ]; then
+                kill "$tail_pid" 2>/dev/null
+                wait "$tail_pid" 2>/dev/null
+            fi
+            break
+        fi
+
+        if [ -n "$tail_pid" ]; then
+            kill "$tail_pid" 2>/dev/null
+            wait "$tail_pid" 2>/dev/null
+        fi
+
+        if [ "$attempt" -lt "$max_attempts" ]; then
+            warn "SLIRP not forwarding data, restarting VM (attempt $((attempt + 1))/$max_attempts)..."
+            kill "$QEMU_PID" 2>/dev/null
+            wait "$QEMU_PID" 2>/dev/null
+        else
+            die "failed to establish SSH after $max_attempts attempts"
+        fi
+    done
 
     todo "VM is up, registering session"
     # Register this VM session so 'schupfn join' and 'schupfn stop' can find it
@@ -1487,9 +1497,9 @@ AcceptEnv LANG LC_*
 PerSourcePenaltyExemptList 10.0.2.2
 SSHD_CONF
 
-    # Enable socket-activated sshd — no need for ordering dependencies
-    # since sshd only spawns when a connection arrives, by which time
-    # the network and mounts are already up.
+    # Enable socket-activated sshd
+    # schupfn-ready.service has After=schupfn-mounts.service sshd.socket
+    # so the host only connects after mounts and sshd are ready.
     _brun bash -c 'mkdir -p /etc/systemd/system/sockets.target.wants && ln -sf /usr/lib/systemd/system/sshd.socket /etc/systemd/system/sockets.target.wants/'
 
     todo_done
@@ -1561,6 +1571,13 @@ SSHD_CONF
     # ── Network: let systemd-networkd handle DHCP via QEMU SLIRP ──────
 
     _brun bash -c 'mkdir -p /etc/systemd/network'
+    _bwrite /etc/systemd/network/10-schupfn.link 0644 <<'LINKCFG'
+[Match]
+Driver=virtio_net
+
+[Link]
+NamePolicy=keep kernel
+LINKCFG
     _bwrite /etc/systemd/network/80-schupfn.network 0644 <<'NETCFG'
 [Match]
 Driver=virtio_net
@@ -1573,6 +1590,21 @@ UseDNS=no
 NETCFG
     _brun bash -c 'mkdir -p /etc/systemd/system/multi-user.target.wants'
     _brun bash -c 'ln -sf /usr/lib/systemd/system/systemd-networkd.service /etc/systemd/system/multi-user.target.wants/'
+    # ── Boot readiness signal ──────────────────────────────────────────
+
+    _bwrite /etc/systemd/system/schupfn-ready.service 0644 <<'READYSVC'
+[Unit]
+Description=Signal schupfn host that guest is ready for SSH
+After=sshd.socket systemd-networkd.service schupfn-mounts.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -c 'echo schupfn-ready > /dev/ttyS0'
+
+[Install]
+WantedBy=multi-user.target
+READYSVC
+    _brun bash -c 'ln -sf /etc/systemd/system/schupfn-ready.service /etc/systemd/system/multi-user.target.wants/'
 
     # ── Hostname ────────────────────────────────────────────────────────
 
