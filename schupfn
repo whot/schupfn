@@ -1491,6 +1491,7 @@ SSHD_CONF
     # since sshd only spawns when a connection arrives, by which time
     # the network and mounts are already up.
     _brun bash -c 'mkdir -p /etc/systemd/system/sockets.target.wants && ln -sf /usr/lib/systemd/system/sshd.socket /etc/systemd/system/sockets.target.wants/'
+    _brun ln -sf /dev/null /etc/systemd/system/sshd.service
 
     todo_done
 
