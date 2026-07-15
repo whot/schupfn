@@ -795,6 +795,57 @@ count_active_joins() {
     echo "$count"
 }
 
+# ── Lifecycle hooks ──────────────────────────────────────────────────────────
+
+# Run a lifecycle hook command on the host.
+#
+# The command string is subject to placeholder expansion:
+#   {ssh_port}   - SSH port on localhost
+#   {ssh_key}    - path to the SSH private key file
+#   {container}  - container/VM name
+#   {workdir}    - working directory
+#
+# The same values are also exported as environment variables:
+#   SCHUPFN_SSH_PORT, SCHUPFN_SSH_KEY, SCHUPFN_CONTAINER, SCHUPFN_WORKDIR
+#
+# If the command exits non-zero, a warning is printed but execution continues.
+# An empty or unset command is silently ignored.
+#
+# $1 = hook name (for display, e.g. "on-enter")
+# $2 = command string (may contain placeholders)
+# $3 = ssh_port
+# $4 = ssh_key path
+# $5 = container name
+# $6 = workdir
+run_hook() {
+    local hook_name="$1"
+    local cmd="$2"
+    local ssh_port="$3"
+    local ssh_key="$4"
+    local container="$5"
+    local workdir="$6"
+
+    [ -n "$cmd" ] || return 0
+
+    # Placeholder expansion
+    cmd="${cmd//\{ssh_port\}/$ssh_port}"
+    cmd="${cmd//\{ssh_key\}/$ssh_key}"
+    cmd="${cmd//\{container\}/$container}"
+    cmd="${cmd//\{workdir\}/$workdir}"
+
+    todo "running $hook_name hook..."
+    local rc=0
+    SCHUPFN_SSH_PORT="$ssh_port" \
+    SCHUPFN_SSH_KEY="$ssh_key" \
+    SCHUPFN_CONTAINER="$container" \
+    SCHUPFN_WORKDIR="$workdir" \
+    bash -c "$cmd" || rc=$?
+    todo_done
+    if [ "$rc" -ne 0 ]; then
+        warn "$hook_name hook exited with status $rc"
+    fi
+}
+
 # ── Configuration file ───────────────────────────────────────────────────────
 
 # Walk from the given directory up to / looking for .schupfn/config.yml.
@@ -871,6 +922,10 @@ find_config_file() {
 #   _cfg_image_size - disk image size (from image.size), empty if not set
 #   _cfg_packages   - array of packages to install in the image (from image.install-packages)
 #   _cfg_follow_git_worktrees - "1" if follow-git-worktrees: true, empty if not set
+#   _cfg_on_enter   - on-enter hook command, empty if not set
+#   _cfg_on_exit    - on-exit hook command, empty if not set
+#   _cfg_on_join    - on-join hook command, empty if not set
+#   _cfg_on_leave   - on-leave hook command, empty if not set
 load_config() {
     local config_file="$1"
 
@@ -903,6 +958,10 @@ load_config() {
         "display="   + (.vm.display // ""),
         "image_size=" + (.image.size // ""),
         "follow_git_worktrees=" + (.["follow-git-worktrees"] | tostring),
+        "on_enter="  + (.["on-enter"] // ""),
+        "on_exit="   + (.["on-exit"] // ""),
+        "on_join="   + (.["on-join"] // ""),
+        "on_leave="  + (.["on-leave"] // ""),
         "__EXPORT_RO__",
         (.["export-ro"] // [] | .[]),
         "__EXPORT_RW__",
@@ -937,6 +996,10 @@ load_config() {
                     display)   _cfg_display="$val" ;;
                     image_size) _cfg_image_size="$val" ;;
                     follow_git_worktrees) raw_follow_git_worktrees="$val" ;;
+                    on_enter)  _cfg_on_enter="$val" ;;
+                    on_exit)   _cfg_on_exit="$val" ;;
+                    on_join)   _cfg_on_join="$val" ;;
+                    on_leave)  _cfg_on_leave="$val" ;;
                 esac
                 ;;
             __EXPORT_RO__)
@@ -962,7 +1025,7 @@ load_config() {
                 ;;
             __KEYS__)
                 [ -z "$line" ] && continue
-                local _known_keys=" container command export-ro export-rw export-cow follow-git-worktrees image image.size image.install-packages vm vm.memory vm.cpus vm.network vm.display "
+                local _known_keys=" container command export-ro export-rw export-cow follow-git-worktrees on-enter on-exit on-join on-leave image image.size image.install-packages vm vm.memory vm.cpus vm.network vm.display "
                 if [[ "$_known_keys" != *" $line "* ]]; then
                     warn "unknown config key '$line' in $config_file"
                 fi
@@ -1054,11 +1117,25 @@ Configuration file:
     export-cow:
       - ~/src/reference-tree
     follow-git-worktrees: true
+    on-enter: "my-sync.sh in {ssh_port} {ssh_key}"
+    on-exit: "my-sync.sh out {ssh_port} {ssh_key}"
     vm:
       memory: 8G
       cpus: 4
       network: false
       display: virtio
+
+Lifecycle hooks:
+  Commands run on the host when a VM session starts or ends. The following
+  placeholders are expanded: {ssh_port}, {ssh_key}, {container}, {workdir}.
+  The same values are exported as environment variables: SCHUPFN_SSH_PORT,
+  SCHUPFN_SSH_KEY, SCHUPFN_CONTAINER, SCHUPFN_WORKDIR.
+  Hooks that fail (non-zero exit) produce a warning but do not abort.
+
+  on-enter   Run after the VM is booted (enter, start)
+  on-exit    Run before the VM is shut down (enter, stop)
+  on-join    Run before connecting to a running VM (join)
+  on-leave   Run after disconnecting from a running VM (join)
 EOF
 }
 
@@ -1911,6 +1988,7 @@ cmd_enter() {
     local -a _cfg_exports_cow=()
     local -a _cfg_packages=()
     local _cfg_container="" _cfg_command="" _cfg_memory="" _cfg_cpus="" _cfg_network="" _cfg_display="" _cfg_image_size="" _cfg_follow_git_worktrees=""
+    local _cfg_on_enter="" _cfg_on_exit="" _cfg_on_join="" _cfg_on_leave=""
     local config_file
     if [ -n "$cli_config" ]; then
         if [ ! -f "$cli_config" ]; then
@@ -2049,6 +2127,9 @@ cmd_enter() {
     # Boot the VM (may exit directly in console mode)
     _boot_vm
 
+    # Run on-enter hook
+    run_hook "on-enter" "$_cfg_on_enter" "$ssh_port" "$cache_dir/ssh_key" "$name" "$PWD"
+
     # SSH into the VM
     local username
     username=$(whoami)
@@ -2069,6 +2150,9 @@ cmd_enter() {
         127.0.0.1 \
         "$remote_cmd"
     local rc=$?
+
+    # Run on-exit hook while the VM is still running
+    run_hook "on-exit" "$_cfg_on_exit" "$ssh_port" "$cache_dir/ssh_key" "$name" "$PWD"
 
     if [ -n "$command" ]; then
         exit "$rc"
@@ -2169,6 +2253,7 @@ cmd_start() {
     local -a _cfg_exports_cow=()
     local -a _cfg_packages=()
     local _cfg_container="" _cfg_command="" _cfg_memory="" _cfg_cpus="" _cfg_network="" _cfg_display="" _cfg_image_size="" _cfg_follow_git_worktrees=""
+    local _cfg_on_enter="" _cfg_on_exit="" _cfg_on_join="" _cfg_on_leave=""
     local config_file
     if [ -n "$cli_config" ]; then
         if [ ! -f "$cli_config" ]; then
@@ -2287,6 +2372,9 @@ cmd_start() {
     # Boot the VM
     _boot_vm
 
+    # Run on-enter hook
+    run_hook "on-enter" "$_cfg_on_enter" "$ssh_port" "$cache_dir/ssh_key" "$name" "$PWD"
+
     # VM is running — clear the EXIT trap so the VM survives our exit
     trap - EXIT
 
@@ -2373,12 +2461,29 @@ cmd_stop() {
     session_image=$(read_session "$session_file" "session_image")
     serial_log=$(read_session "$session_file" "serial_log")
 
+    local ssh_port workdir ssh_key_file
+    ssh_port=$(read_session "$session_file" "ssh_port")
+    workdir=$(read_session "$session_file" "workdir")
+    ssh_key_file=$(read_session "$session_file" "ssh_key")
+
     if ! kill -0 "$vm_pid" 2>/dev/null; then
         info "VM '$name' (pid $vm_pid) is no longer running, cleaning up"
         rm -f "$session_image" "$serial_log"
         remove_session "$name" "$vm_pid"
         return 0
     fi
+
+    # Load config to get on-exit hook
+    local -a _cfg_exports=() _cfg_exports_rw=() _cfg_exports_cow=() _cfg_packages=()
+    local _cfg_container="" _cfg_command="" _cfg_memory="" _cfg_cpus="" _cfg_network="" _cfg_display="" _cfg_image_size="" _cfg_follow_git_worktrees=""
+    local _cfg_on_enter="" _cfg_on_exit="" _cfg_on_join="" _cfg_on_leave=""
+    local config_file
+    if config_file=$(find_config_file "${workdir:-$PWD}" "$name"); then
+        load_config "$config_file"
+    fi
+
+    # Run on-exit hook while the VM is still running
+    run_hook "on-exit" "$_cfg_on_exit" "$ssh_port" "$ssh_key_file" "$name" "${workdir:-$PWD}"
 
     # Wait for active join sessions to finish
     local joins
@@ -2525,11 +2630,23 @@ cmd_join() {
     local vm_pid
     vm_pid=$(read_session "$session_file" "pid")
 
+    # Load config to get on-join/on-leave hooks
+    local -a _cfg_exports=() _cfg_exports_rw=() _cfg_exports_cow=() _cfg_packages=()
+    local _cfg_container="" _cfg_command="" _cfg_memory="" _cfg_cpus="" _cfg_network="" _cfg_display="" _cfg_image_size="" _cfg_follow_git_worktrees=""
+    local _cfg_on_enter="" _cfg_on_exit="" _cfg_on_join="" _cfg_on_leave=""
+    local config_file
+    if config_file=$(find_config_file "${workdir:-$PWD}" "$name"); then
+        load_config "$config_file"
+    fi
+
     info "joining VM '$name' (ssh port $ssh_port)..."
 
     # Register this join session so 'enter' can detect it
     acquire_join_lock "$name" "$vm_pid" "$$"
     trap 'release_join_lock "$name" "$vm_pid" "$$"' EXIT
+
+    # Run on-join hook
+    run_hook "on-join" "$_cfg_on_join" "$ssh_port" "$ssh_key_file" "$name" "${workdir:-$PWD}"
 
     # Build SSH options
     local -a ssh_opts=(
@@ -2561,6 +2678,9 @@ cmd_join() {
         127.0.0.1 \
         "$remote_cmd"
     local rc=$?
+
+    # Run on-leave hook while the VM is still running
+    run_hook "on-leave" "$_cfg_on_leave" "$ssh_port" "$ssh_key_file" "$name" "${workdir:-$PWD}"
 
     release_join_lock "$name" "$vm_pid" "$$"
 
