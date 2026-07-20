@@ -120,6 +120,7 @@ init_cfg_vars() {
     _cfg_follow_git_worktrees=""
     _cfg_image_size=""
     _cfg_packages=()
+    _cfg_env=()
     _cfg_on_enter=""
     _cfg_on_exit=""
     _cfg_on_join=""
@@ -216,4 +217,95 @@ on-leave: "cmd4"
 EOF
     load_config "$TMPDIR/config.yml"
     assert_no_warnings
+}
+
+# ── load_config: env ────────────────────────────────────────────────────────
+
+@test "load_config: parses env variables" {
+    yq_or_skip
+    init_cfg_vars
+    cat > "$TMPDIR/config.yml" <<'EOF'
+env:
+  MY_VAR: hello
+  OTHER_VAR: world
+EOF
+    load_config "$TMPDIR/config.yml"
+    [ ${#_cfg_env[@]} -eq 2 ]
+    [[ " ${_cfg_env[*]} " == *" MY_VAR=hello "* ]]
+    [[ " ${_cfg_env[*]} " == *" OTHER_VAR=world "* ]]
+}
+
+@test "load_config: env defaults to empty" {
+    yq_or_skip
+    init_cfg_vars
+    cat > "$TMPDIR/config.yml" <<'EOF'
+container: my-toolbox
+EOF
+    load_config "$TMPDIR/config.yml"
+    [ ${#_cfg_env[@]} -eq 0 ]
+}
+
+@test "load_config: no unknown key warning for env" {
+    yq_or_skip
+    init_cfg_vars
+    cat > "$TMPDIR/config.yml" <<'EOF'
+env:
+  FOO: bar
+EOF
+    load_config "$TMPDIR/config.yml"
+    assert_no_warnings
+}
+
+@test "load_config: env with numeric value" {
+    yq_or_skip
+    init_cfg_vars
+    cat > "$TMPDIR/config.yml" <<'EOF'
+env:
+  PORT: 8080
+EOF
+    load_config "$TMPDIR/config.yml"
+    [ ${#_cfg_env[@]} -eq 1 ]
+    [ "${_cfg_env[0]}" = "PORT=8080" ]
+}
+
+@test "run_hook: exports env: config variables" {
+    _cfg_env=(MY_VAR=hello OTHER_VAR=world)
+    local outfile="$TMPDIR/out"
+    run_hook "on-enter" 'echo $MY_VAR $OTHER_VAR > '"'$outfile'" "1234" "/key" "myvm" "/work" "test-uuid"
+    [ "$(cat "$outfile")" = "hello world" ]
+}
+
+@test "run_hook: env: config variables do not leak into parent shell" {
+    _cfg_env=(MY_VAR=hello)
+    unset MY_VAR 2>/dev/null || true
+    run_hook "on-enter" "true" "1234" "/key" "myvm" "/work" "test-uuid"
+    [ -z "${MY_VAR:-}" ]
+}
+
+@test "run_hook: expands placeholders in env: values" {
+    _cfg_env=("SYNC_DIR={workdir}/.sync/{uuid}")
+    local outfile="$TMPDIR/out"
+    run_hook "on-enter" 'echo $SYNC_DIR > '"'$outfile'" "1234" "/key" "myvm" "/my/work" "abc-uuid"
+    [ "$(cat "$outfile")" = "/my/work/.sync/abc-uuid" ]
+}
+
+@test "run_hook: env keys available as placeholders in command" {
+    _cfg_env=("FOOBAR=abc")
+    local outfile="$TMPDIR/out"
+    run_hook "on-enter" "echo {FOOBAR} > '$outfile'" "1234" "/key" "myvm" "/work" "test-uuid"
+    [ "$(cat "$outfile")" = "abc" ]
+}
+
+@test "run_hook: env key placeholder with resolved value" {
+    _cfg_env=("SYNC_DIR={workdir}/.sync/{uuid}")
+    local outfile="$TMPDIR/out"
+    run_hook "on-enter" "echo {SYNC_DIR} > '$outfile'" "1234" "/key" "myvm" "/my/work" "abc-uuid"
+    [ "$(cat "$outfile")" = "/my/work/.sync/abc-uuid" ]
+}
+
+@test "run_hook: works without _cfg_env in scope" {
+    unset _cfg_env 2>/dev/null || true
+    local outfile="$TMPDIR/out"
+    run_hook "on-enter" "echo ok > '$outfile'" "1234" "/key" "myvm" "/work" "test-uuid"
+    [ "$(cat "$outfile")" = "ok" ]
 }

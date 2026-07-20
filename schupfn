@@ -383,6 +383,7 @@ cleanup_vm() {
 #   cow_mount_dirs  - array of directories to mount copy-on-write
 #   rootfs_symlinks - array of "link:target" pairs to create in guest
 #   dotfiles        - array of file paths to copy into guest
+#   _cfg_env        - array of "KEY=VALUE" environment variable pairs
 #
 # Variables set in caller's scope on return:
 #   QEMU_PID        - (global) PID of the background qemu process
@@ -446,6 +447,11 @@ _boot_vm() {
         "schupfn.user=$username"
         "schupfn.home=$HOME"
     )
+
+    # Pass configured environment variables to the guest
+    for env_entry in "${_cfg_env[@]}"; do
+        kernel_args+=("schupfn.env=$env_entry")
+    done
 
     if [ "$verbose" != "1" ]; then
         kernel_args+=("quiet")
@@ -808,6 +814,9 @@ count_active_joins() {
 # The same values are also exported as environment variables:
 #   SCHUPFN_SSH_PORT, SCHUPFN_SSH_KEY, SCHUPFN_CONTAINER, SCHUPFN_WORKDIR
 #
+# Any variables from the env: config section (_cfg_env array in the
+# caller's scope) are also exported to the hook command.
+#
 # If the command exits non-zero, a warning is printed but execution continues.
 # An empty or unset command is silently ignored.
 #
@@ -827,18 +836,39 @@ run_hook() {
 
     [ -n "$cmd" ] || return 0
 
-    # Placeholder expansion
+    # Placeholder expansion: built-in placeholders first
     cmd="${cmd//\{ssh_port\}/$ssh_port}"
     cmd="${cmd//\{ssh_key\}/$ssh_key}"
     cmd="${cmd//\{container\}/$container}"
     cmd="${cmd//\{workdir\}/$workdir}"
 
+    # Resolve env: config variables.  Values support the same built-in
+    # placeholders, and the resolved KEY=VALUE pairs are then available
+    # as {KEY} placeholders in the hook command.
+    local -a env_exports=()
+    if declare -p _cfg_env &>/dev/null && [ ${#_cfg_env[@]} -gt 0 ]; then
+        for entry in "${_cfg_env[@]}"; do
+            entry="${entry//\{ssh_port\}/$ssh_port}"
+            entry="${entry//\{ssh_key\}/$ssh_key}"
+            entry="${entry//\{container\}/$container}"
+            entry="${entry//\{workdir\}/$workdir}"
+            entry="${entry//\{uuid\}/$uuid}"
+            env_exports+=("$entry")
+            # Expand {KEY} in the command
+            local key="${entry%%=*}"
+            local val="${entry#*=}"
+            cmd="${cmd//\{$key\}/$val}"
+        done
+    fi
+
     todo "running $hook_name hook..."
     local rc=0
+    env \
     SCHUPFN_SSH_PORT="$ssh_port" \
     SCHUPFN_SSH_KEY="$ssh_key" \
     SCHUPFN_CONTAINER="$container" \
     SCHUPFN_WORKDIR="$workdir" \
+    "${env_exports[@]}" \
     bash -c "$cmd" || rc=$?
     todo_done
     if [ "$rc" -ne 0 ]; then
@@ -921,6 +951,7 @@ find_config_file() {
 #   _cfg_display    - VM display adapter type, empty if not set
 #   _cfg_image_size - disk image size (from image.size), empty if not set
 #   _cfg_packages   - array of packages to install in the image (from image.install-packages)
+#   _cfg_env        - array of "KEY=VALUE" environment variables for the guest
 #   _cfg_follow_git_worktrees - "1" if follow-git-worktrees: true, empty if not set
 #   _cfg_on_enter   - on-enter hook command, empty if not set
 #   _cfg_on_exit    - on-exit hook command, empty if not set
@@ -970,6 +1001,8 @@ load_config() {
         (.["export-cow"] // [] | .[]),
         "__PACKAGES__",
         (.image["install-packages"] // [] | .[]),
+        "__ENV__",
+        (.env // {} | to_entries[] | .key + "=" + (.value | tostring)),
         "__KEYS__",
         ([.. | path | map(select(tag != "!!int")) | join(".")] | unique | .[])
     ' "$config_file" 2>/dev/null) || die "failed to parse config file: $config_file"
@@ -979,7 +1012,7 @@ load_config() {
     local raw_cpus="" raw_network="" raw_follow_git_worktrees=""
     while IFS= read -r line; do
         case "$line" in
-            __SCALARS__|__EXPORT_RO__|__EXPORT_RW__|__EXPORT_COW__|__PACKAGES__|__KEYS__)
+            __SCALARS__|__EXPORT_RO__|__EXPORT_RW__|__EXPORT_COW__|__PACKAGES__|__ENV__|__KEYS__)
                 section="$line"; continue ;;
         esac
 
@@ -1023,9 +1056,16 @@ load_config() {
             __PACKAGES__)
                 [ -n "$line" ] && _cfg_packages+=("$line")
                 ;;
+            __ENV__)
+                [ -n "$line" ] && _cfg_env+=("$line")
+                ;;
             __KEYS__)
                 [ -z "$line" ] && continue
-                local _known_keys=" container command export-ro export-rw export-cow follow-git-worktrees on-enter on-exit on-join on-leave image image.size image.install-packages vm vm.memory vm.cpus vm.network vm.display "
+                local _known_keys=" container command export-ro export-rw export-cow follow-git-worktrees on-enter on-exit on-join on-leave env image image.size image.install-packages vm vm.memory vm.cpus vm.network vm.display "
+                # env.* keys are user-defined, skip the warning
+                if [[ "$line" == env.* ]]; then
+                    continue
+                fi
                 if [[ "$_known_keys" != *" $line "* ]]; then
                     warn "unknown config key '$line' in $config_file"
                 fi
@@ -1117,6 +1157,9 @@ Configuration file:
     export-cow:
       - ~/src/reference-tree
     follow-git-worktrees: true
+    env:
+      MY_VAR: my-value
+      SCHUPFN_OPENCODE: ~/.opencode/bin/opencode
     on-enter: "my-sync.sh in {ssh_port} {ssh_key}"
     on-exit: "my-sync.sh out {ssh_port} {ssh_key}"
     vm:
@@ -1124,6 +1167,10 @@ Configuration file:
       cpus: 4
       network: false
       display: virtio
+
+Environment variables:
+  Key-value pairs under env: are set inside the VM via /etc/profile.d
+  and are available in SSH sessions (login shells).
 
 Lifecycle hooks:
   Commands run on the host when a VM session starts or ends. The following
@@ -1306,10 +1353,12 @@ sleep 0.5
 # Parse kernel command line
 schupfn_user=""
 schupfn_home=""
+schupfn_envs=()
 for param in $(cat /proc/cmdline); do
     case "$param" in
         schupfn.user=*) schupfn_user="${param#schupfn.user=}" ;;
         schupfn.home=*) schupfn_home="${param#schupfn.home=}" ;;
+        schupfn.env=*)   schupfn_envs+=("${param#schupfn.env=}") ;;
         schupfn.9p=*)
             spec="${param#schupfn.9p=}"
             tag="${spec%%:*}"; rest="${spec#*:}"
@@ -1385,6 +1434,15 @@ if [ -n "$schupfn_user" ] && [ -n "$schupfn_home" ] && [ -d "$schupfn_home" ]; t
     if [ -n "$uid" ] && [ -n "$gid" ]; then
         find "$schupfn_home" -xdev -exec chown "$uid:$gid" {} + 2>/dev/null || true
     fi
+fi
+
+# Export environment variables configured via env: in config.yml.
+# /etc/profile.d is sourced by login shells (SSH sessions).
+if [ ${#schupfn_envs[@]} -gt 0 ]; then
+    mkdir -p /etc/profile.d
+    for entry in "${schupfn_envs[@]}"; do
+        echo "export $entry"
+    done > /etc/profile.d/schupfn-env.sh
 fi
 SCRIPT
 }
@@ -1831,6 +1889,7 @@ cmd_create() {
     local -a _cfg_exports_rw=()
     local -a _cfg_exports_cow=()
     local -a _cfg_packages=()
+    local -a _cfg_env=()
     local _cfg_container="" _cfg_command="" _cfg_memory="" _cfg_cpus="" _cfg_network="" _cfg_display="" _cfg_image_size="" _cfg_follow_git_worktrees=""
     local config_file
     if [ -n "$cli_config" ]; then
@@ -1987,6 +2046,7 @@ cmd_enter() {
     local -a _cfg_exports_rw=()
     local -a _cfg_exports_cow=()
     local -a _cfg_packages=()
+    local -a _cfg_env=()
     local _cfg_container="" _cfg_command="" _cfg_memory="" _cfg_cpus="" _cfg_network="" _cfg_display="" _cfg_image_size="" _cfg_follow_git_worktrees=""
     local _cfg_on_enter="" _cfg_on_exit="" _cfg_on_join="" _cfg_on_leave=""
     local config_file
@@ -2252,6 +2312,7 @@ cmd_start() {
     local -a _cfg_exports_rw=()
     local -a _cfg_exports_cow=()
     local -a _cfg_packages=()
+    local -a _cfg_env=()
     local _cfg_container="" _cfg_command="" _cfg_memory="" _cfg_cpus="" _cfg_network="" _cfg_display="" _cfg_image_size="" _cfg_follow_git_worktrees=""
     local _cfg_on_enter="" _cfg_on_exit="" _cfg_on_join="" _cfg_on_leave=""
     local config_file
@@ -2474,7 +2535,7 @@ cmd_stop() {
     fi
 
     # Load config to get on-exit hook
-    local -a _cfg_exports=() _cfg_exports_rw=() _cfg_exports_cow=() _cfg_packages=()
+    local -a _cfg_exports=() _cfg_exports_rw=() _cfg_exports_cow=() _cfg_packages=() _cfg_env=()
     local _cfg_container="" _cfg_command="" _cfg_memory="" _cfg_cpus="" _cfg_network="" _cfg_display="" _cfg_image_size="" _cfg_follow_git_worktrees=""
     local _cfg_on_enter="" _cfg_on_exit="" _cfg_on_join="" _cfg_on_leave=""
     local config_file
@@ -2631,7 +2692,7 @@ cmd_join() {
     vm_pid=$(read_session "$session_file" "pid")
 
     # Load config to get on-join/on-leave hooks
-    local -a _cfg_exports=() _cfg_exports_rw=() _cfg_exports_cow=() _cfg_packages=()
+    local -a _cfg_exports=() _cfg_exports_rw=() _cfg_exports_cow=() _cfg_packages=() _cfg_env=()
     local _cfg_container="" _cfg_command="" _cfg_memory="" _cfg_cpus="" _cfg_network="" _cfg_display="" _cfg_image_size="" _cfg_follow_git_worktrees=""
     local _cfg_on_enter="" _cfg_on_exit="" _cfg_on_join="" _cfg_on_leave=""
     local config_file
