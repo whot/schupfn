@@ -1122,7 +1122,7 @@ EOF
 
 usage_enter() {
     cat <<EOF
-Usage: $PROGNAME enter [<name>] [options]
+Usage: $PROGNAME enter [<name>] [options] [-- [command] [args...]]
 
 Boot a previously created VM image and connect to it via SSH. The current
 directory is mounted read-write inside the VM.
@@ -1131,6 +1131,20 @@ The image must already exist; run '$PROGNAME create <name>' first to
 export the container to a disk image.
 
 If <name> is omitted, the 'container' field from the config file is used.
+
+Arguments after -- are passed through to the command running inside the VM.
+If the first argument after -- does not start with '-', it is used as the
+command (equivalent to --command). Any remaining arguments are appended.
+
+If the command string (from --command or config) contains {args}, the
+passthrough arguments are substituted there instead of being appended.
+
+  $PROGNAME enter myvm -- ls -la        # run "ls -la"
+  $PROGNAME enter myvm -- -l            # run shell with "-l"
+  $PROGNAME enter myvm --command ls -- -la  # run "ls -la"
+
+With config command: "wrapper.sh {args}", passthrough arguments are
+inserted at the {args} position.
 
 Options:
   --export-ro <path>  Additional host path to make available in the VM (repeatable)
@@ -1300,7 +1314,7 @@ EOF
 
 usage_join() {
     cat <<EOF
-Usage: $PROGNAME join [<name>] [options]
+Usage: $PROGNAME join [<name>] [options] [-- [command] [args...]]
 
 Open a new SSH session to an already-running VM.
 
@@ -1310,6 +1324,10 @@ automatically. If multiple VMs are running, an interactive menu is shown.
 Active join sessions are tracked automatically. When the 'enter' session
 exits, the VM waits for all join sessions to disconnect before shutting
 down.
+
+Arguments after -- are passed through to the command running inside the VM.
+If the first argument after -- does not start with '-', it is used as the
+command (equivalent to --command). Any remaining arguments are appended.
 
 Options:
   --command <cmd>   Run <cmd> in the VM instead of an interactive shell
@@ -1972,11 +1990,12 @@ cmd_enter() {
     local network=""
     local verbose=0
     local console=0
-    local command=""
+     local command=""
     local cli_config=""
     local -a exports=()
     local -a exports_rw=()
     local -a exports_cow=()
+    local -a passthrough_args=()
     local cli_memory="" cli_cpus="" cli_network="" cli_display=""
     local follow_git_worktrees=0
 
@@ -2044,6 +2063,17 @@ cmd_enter() {
             --console)
                 console=1
                 shift
+                ;;
+            --)
+                shift
+                # First arg after -- becomes the command if it doesn't
+                # start with '-'; remaining args are passed through.
+                if [ $# -gt 0 ] && [[ "$1" != -* ]]; then
+                    command="$1"
+                    shift
+                fi
+                passthrough_args=("$@")
+                break
                 ;;
             -*)
                 die "unknown option: $1"
@@ -2217,11 +2247,31 @@ cmd_enter() {
     username=$(whoami)
     local quoted_pwd
     printf -v quoted_pwd '%q' "$PWD"
+
+    # Build quoted passthrough arguments string
+    local quoted_args=""
+    if [ ${#passthrough_args[@]} -gt 0 ]; then
+        for arg in "${passthrough_args[@]}"; do
+            printf -v qarg '%q' "$arg"
+            quoted_args+=" $qarg"
+        done
+    fi
+
+    # If the command contains {args}, substitute it; otherwise append.
+    if [ -n "$command" ]; then
+        if [[ "$command" == *"{args}"* ]]; then
+            # Trim leading space for inline substitution
+            command="${command//\{args\}/${quoted_args# }}"
+        else
+            command+="$quoted_args"
+        fi
+    fi
+
     local remote_cmd
     if [ -n "$command" ]; then
         remote_cmd="cd $quoted_pwd && $command"
     else
-        remote_cmd="cd $quoted_pwd && exec \$SHELL -l"
+        remote_cmd="cd $quoted_pwd && exec \$SHELL -l$quoted_args"
     fi
 
     info "Entering VM based on '$name' now."
@@ -2626,6 +2676,7 @@ cmd_stop() {
 cmd_join() {
     local name=""
     local command=""
+    local -a passthrough_args=()
 
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -2637,6 +2688,15 @@ cmd_join() {
                 [ $# -ge 2 ] || die "--command requires an argument"
                 command="$2"
                 shift 2
+                ;;
+            --)
+                shift
+                if [ $# -gt 0 ] && [[ "$1" != -* ]]; then
+                    command="$1"
+                    shift
+                fi
+                passthrough_args=("$@")
+                break
                 ;;
             -*)
                 die "unknown option: $1"
@@ -2751,10 +2811,28 @@ cmd_join() {
     local quoted_workdir
     printf -v quoted_workdir '%q' "$workdir"
     local remote_cmd
+    # Build quoted passthrough arguments string
+    local quoted_args=""
+    if [ ${#passthrough_args[@]} -gt 0 ]; then
+        for arg in "${passthrough_args[@]}"; do
+            printf -v qarg '%q' "$arg"
+            quoted_args+=" $qarg"
+        done
+    fi
+
+    # If the command contains {args}, substitute it; otherwise append.
+    if [ -n "$command" ]; then
+        if [[ "$command" == *"{args}"* ]]; then
+            command="${command//\{args\}/${quoted_args# }}"
+        else
+            command+="$quoted_args"
+        fi
+    fi
+
     if [ -n "$command" ]; then
         remote_cmd="cd $quoted_workdir && $command"
     else
-        remote_cmd="cd $quoted_workdir && exec \$SHELL -l"
+        remote_cmd="cd $quoted_workdir && exec \$SHELL -l$quoted_args"
     fi
 
     ssh -t \
