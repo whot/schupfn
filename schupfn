@@ -434,6 +434,10 @@ _boot_vm() {
     #   services like sshd, dbus, and mount operations.
     # systemd.condition-needs-update=: suppress "System Needs Update"
     #   checks that can cause unnecessary firstboot-like behavior.
+    # Generate a unique ID for this VM session so hooks and guest
+    # scripts can identify files belonging to this instance.
+    session_uuid=$(uuidgen)
+
     local -a kernel_args=(
         "root=/dev/vda"
         "rw"
@@ -446,10 +450,13 @@ _boot_vm() {
         "schupfn.chdir=$PWD"
         "schupfn.user=$username"
         "schupfn.home=$HOME"
+        "schupfn.uuid=$session_uuid"
     )
 
-    # Pass configured environment variables to the guest
+    # Pass configured environment variables to the guest.
+    # Values support {uuid} placeholder expansion.
     for env_entry in "${_cfg_env[@]}"; do
+        env_entry="${env_entry//\{uuid\}/$session_uuid}"
         kernel_args+=("schupfn.env=$env_entry")
     done
 
@@ -580,7 +587,7 @@ _boot_vm() {
 
     todo "VM is up, registering session"
     # Register this VM session so 'schupfn join' and 'schupfn stop' can find it
-    write_session "$name" "$QEMU_PID" "$ssh_port" "$PWD" "$image_key" "$session_image" "$serial_log"
+    write_session "$name" "$QEMU_PID" "$ssh_port" "$PWD" "$image_key" "$session_image" "$serial_log" "$session_uuid"
     todo_done
 
     # Build SSH options for the caller
@@ -662,6 +669,7 @@ write_session() {
     local ssh_key="${5:-}"
     local session_image="${6:-}"
     local serial_log="${7:-}"
+    local uuid="${8:-}"
 
     mkdir -p -m 0700 "$SESSION_DIR"
 
@@ -673,6 +681,7 @@ workdir=$workdir
 ssh_key=$ssh_key
 session_image=$session_image
 serial_log=$serial_log
+uuid=$uuid
 started_at=$(date -Iseconds)
 EOF
 }
@@ -810,9 +819,11 @@ count_active_joins() {
 #   {ssh_key}    - path to the SSH private key file
 #   {container}  - container/VM name
 #   {workdir}    - working directory
+#   {uuid}       - unique session identifier
 #
 # The same values are also exported as environment variables:
-#   SCHUPFN_SSH_PORT, SCHUPFN_SSH_KEY, SCHUPFN_CONTAINER, SCHUPFN_WORKDIR
+#   SCHUPFN_SSH_PORT, SCHUPFN_SSH_KEY, SCHUPFN_CONTAINER, SCHUPFN_WORKDIR,
+#   SCHUPFN_UUID
 #
 # Any variables from the env: config section (_cfg_env array in the
 # caller's scope) are also exported to the hook command.
@@ -826,6 +837,7 @@ count_active_joins() {
 # $4 = ssh_key path
 # $5 = container name
 # $6 = workdir
+# $7 = uuid
 run_hook() {
     local hook_name="$1"
     local cmd="$2"
@@ -833,6 +845,7 @@ run_hook() {
     local ssh_key="$4"
     local container="$5"
     local workdir="$6"
+    local uuid="${7:-}"
 
     [ -n "$cmd" ] || return 0
 
@@ -841,6 +854,7 @@ run_hook() {
     cmd="${cmd//\{ssh_key\}/$ssh_key}"
     cmd="${cmd//\{container\}/$container}"
     cmd="${cmd//\{workdir\}/$workdir}"
+    cmd="${cmd//\{uuid\}/$uuid}"
 
     # Resolve env: config variables.  Values support the same built-in
     # placeholders, and the resolved KEY=VALUE pairs are then available
@@ -868,6 +882,7 @@ run_hook() {
     SCHUPFN_SSH_KEY="$ssh_key" \
     SCHUPFN_CONTAINER="$container" \
     SCHUPFN_WORKDIR="$workdir" \
+    SCHUPFN_UUID="$uuid" \
     "${env_exports[@]}" \
     bash -c "$cmd" || rc=$?
     todo_done
@@ -1174,9 +1189,10 @@ Environment variables:
 
 Lifecycle hooks:
   Commands run on the host when a VM session starts or ends. The following
-  placeholders are expanded: {ssh_port}, {ssh_key}, {container}, {workdir}.
-  The same values are exported as environment variables: SCHUPFN_SSH_PORT,
-  SCHUPFN_SSH_KEY, SCHUPFN_CONTAINER, SCHUPFN_WORKDIR.
+  placeholders are expanded: {ssh_port}, {ssh_key}, {container}, {workdir},
+  {uuid}.  The same values are exported as environment variables:
+  SCHUPFN_SSH_PORT, SCHUPFN_SSH_KEY, SCHUPFN_CONTAINER, SCHUPFN_WORKDIR,
+  SCHUPFN_UUID.
   Hooks that fail (non-zero exit) produce a warning but do not abort.
 
   on-enter   Run after the VM is booted (enter, start)
@@ -1353,11 +1369,13 @@ sleep 0.5
 # Parse kernel command line
 schupfn_user=""
 schupfn_home=""
+schupfn_uuid=""
 schupfn_envs=()
 for param in $(cat /proc/cmdline); do
     case "$param" in
         schupfn.user=*) schupfn_user="${param#schupfn.user=}" ;;
         schupfn.home=*) schupfn_home="${param#schupfn.home=}" ;;
+        schupfn.uuid=*)  schupfn_uuid="${param#schupfn.uuid=}" ;;
         schupfn.env=*)   schupfn_envs+=("${param#schupfn.env=}") ;;
         schupfn.9p=*)
             spec="${param#schupfn.9p=}"
@@ -1436,10 +1454,14 @@ if [ -n "$schupfn_user" ] && [ -n "$schupfn_home" ] && [ -d "$schupfn_home" ]; t
     fi
 fi
 
-# Export environment variables configured via env: in config.yml.
-# /etc/profile.d is sourced by login shells (SSH sessions).
+# Export environment variables configured via env: in config.yml and
+# the session UUID.  /etc/profile.d is sourced by login shells (SSH
+# sessions).
+mkdir -p /etc/profile.d
+if [ -n "$schupfn_uuid" ]; then
+    echo "export SCHUPFN_UUID=$schupfn_uuid" > /etc/profile.d/schupfn-uuid.sh
+fi
 if [ ${#schupfn_envs[@]} -gt 0 ]; then
-    mkdir -p /etc/profile.d
     for entry in "${schupfn_envs[@]}"; do
         echo "export $entry"
     done > /etc/profile.d/schupfn-env.sh
@@ -1885,15 +1907,15 @@ cmd_create() {
     # falling back to $XDG_CONFIG_HOME/schupfn/<name>-config.yml (if the
     # container name is known from the CLI), then default-config.yml.
     # Config values provide defaults; CLI arguments always take precedence.
-    local -a _cfg_exports=()
-    local -a _cfg_exports_rw=()
-    local -a _cfg_exports_cow=()
-    local -a _cfg_packages=()
-    local -a _cfg_env=()
-    local _cfg_container="" _cfg_command="" _cfg_memory="" _cfg_cpus="" _cfg_network="" _cfg_display="" _cfg_image_size="" _cfg_follow_git_worktrees=""
-    local config_file
-    if [ -n "$cli_config" ]; then
-        if [ ! -f "$cli_config" ]; then
+     local -a _cfg_exports=()
+     local -a _cfg_exports_rw=()
+     local -a _cfg_exports_cow=()
+     local -a _cfg_packages=()
+     local -a _cfg_env=()
+     local _cfg_container="" _cfg_command="" _cfg_memory="" _cfg_cpus="" _cfg_network="" _cfg_display="" _cfg_image_size="" _cfg_follow_git_worktrees=""
+     local config_file
+     if [ -n "$cli_config" ]; then
+         if [ ! -f "$cli_config" ]; then
             die "config file not found: $cli_config"
         fi
         config_file="$cli_config"
@@ -2177,7 +2199,7 @@ cmd_enter() {
     check_nested_export_conflicts
 
     # Variables set by _boot_vm in our scope
-    local ssh_port="" session_image="" serial_log=""
+    local ssh_port="" session_image="" serial_log="" session_uuid=""
     local -a ssh_opts=()
 
     # Ensure we clean up the VM on exit (Ctrl-C, errors, normal exit).
@@ -2188,7 +2210,7 @@ cmd_enter() {
     _boot_vm
 
     # Run on-enter hook
-    run_hook "on-enter" "$_cfg_on_enter" "$ssh_port" "$cache_dir/ssh_key" "$name" "$PWD"
+    run_hook "on-enter" "$_cfg_on_enter" "$ssh_port" "$cache_dir/ssh_key" "$name" "$PWD" "$session_uuid"
 
     # SSH into the VM
     local username
@@ -2212,7 +2234,7 @@ cmd_enter() {
     local rc=$?
 
     # Run on-exit hook while the VM is still running
-    run_hook "on-exit" "$_cfg_on_exit" "$ssh_port" "$cache_dir/ssh_key" "$name" "$PWD"
+    run_hook "on-exit" "$_cfg_on_exit" "$ssh_port" "$cache_dir/ssh_key" "$name" "$PWD" "$session_uuid"
 
     if [ -n "$command" ]; then
         exit "$rc"
@@ -2424,7 +2446,7 @@ cmd_start() {
     check_nested_export_conflicts
 
     # Variables set by _boot_vm in our scope
-    local ssh_port="" session_image="" serial_log=""
+    local ssh_port="" session_image="" serial_log="" session_uuid=""
     local -a ssh_opts=()
 
     # Set a temporary EXIT trap so boot failures are cleaned up
@@ -2434,7 +2456,7 @@ cmd_start() {
     _boot_vm
 
     # Run on-enter hook
-    run_hook "on-enter" "$_cfg_on_enter" "$ssh_port" "$cache_dir/ssh_key" "$name" "$PWD"
+    run_hook "on-enter" "$_cfg_on_enter" "$ssh_port" "$cache_dir/ssh_key" "$name" "$PWD" "$session_uuid"
 
     # VM is running — clear the EXIT trap so the VM survives our exit
     trap - EXIT
@@ -2522,10 +2544,11 @@ cmd_stop() {
     session_image=$(read_session "$session_file" "session_image")
     serial_log=$(read_session "$session_file" "serial_log")
 
-    local ssh_port workdir ssh_key_file
+    local ssh_port workdir ssh_key_file session_uuid
     ssh_port=$(read_session "$session_file" "ssh_port")
     workdir=$(read_session "$session_file" "workdir")
     ssh_key_file=$(read_session "$session_file" "ssh_key")
+    session_uuid=$(read_session "$session_file" "uuid")
 
     if ! kill -0 "$vm_pid" 2>/dev/null; then
         info "VM '$name' (pid $vm_pid) is no longer running, cleaning up"
@@ -2544,7 +2567,7 @@ cmd_stop() {
     fi
 
     # Run on-exit hook while the VM is still running
-    run_hook "on-exit" "$_cfg_on_exit" "$ssh_port" "$ssh_key_file" "$name" "${workdir:-$PWD}"
+    run_hook "on-exit" "$_cfg_on_exit" "$ssh_port" "$ssh_key_file" "$name" "${workdir:-$PWD}" "$session_uuid"
 
     # Wait for active join sessions to finish
     local joins
@@ -2675,10 +2698,11 @@ cmd_join() {
     fi
 
     # Read session details
-    local ssh_port workdir ssh_key_file
+    local ssh_port workdir ssh_key_file session_uuid
     ssh_port=$(read_session "$session_file" "ssh_port")
     workdir=$(read_session "$session_file" "workdir")
     ssh_key_file=$(read_session "$session_file" "ssh_key")
+    session_uuid=$(read_session "$session_file" "uuid")
 
     if ! [[ "$ssh_port" =~ ^[0-9]+$ ]]; then
         die "corrupted session file: invalid ssh_port '$ssh_port'"
@@ -2707,7 +2731,7 @@ cmd_join() {
     trap 'release_join_lock "$name" "$vm_pid" "$$"' EXIT
 
     # Run on-join hook
-    run_hook "on-join" "$_cfg_on_join" "$ssh_port" "$ssh_key_file" "$name" "${workdir:-$PWD}"
+    run_hook "on-join" "$_cfg_on_join" "$ssh_port" "$ssh_key_file" "$name" "${workdir:-$PWD}" "$session_uuid"
 
     # Build SSH options
     local -a ssh_opts=(
@@ -2741,7 +2765,7 @@ cmd_join() {
     local rc=$?
 
     # Run on-leave hook while the VM is still running
-    run_hook "on-leave" "$_cfg_on_leave" "$ssh_port" "$ssh_key_file" "$name" "${workdir:-$PWD}"
+    run_hook "on-leave" "$_cfg_on_leave" "$ssh_port" "$ssh_key_file" "$name" "${workdir:-$PWD}" "$session_uuid"
 
     release_join_lock "$name" "$vm_pid" "$$"
 

@@ -14,89 +14,109 @@ teardown() {
 # ── run_hook ────────────────────────────────────────────────────────────────
 
 @test "run_hook: empty command is a no-op" {
-    run_hook "on-enter" "" "1234" "/path/key" "myvm" "/work"
+    run_hook "on-enter" "" "1234" "/path/key" "myvm" "/work" "test-uuid"
     assert_no_warnings
 }
 
 @test "run_hook: expands {ssh_port} placeholder" {
     local outfile="$TMPDIR/out"
-    run_hook "on-enter" "echo {ssh_port} > '$outfile'" "5555" "/path/key" "myvm" "/work"
+    run_hook "on-enter" "echo {ssh_port} > '$outfile'" "5555" "/path/key" "myvm" "/work" "test-uuid"
     [ "$(cat "$outfile")" = "5555" ]
 }
 
 @test "run_hook: expands {ssh_key} placeholder" {
     local outfile="$TMPDIR/out"
-    run_hook "on-enter" "echo {ssh_key} > '$outfile'" "1234" "/my/key" "myvm" "/work"
+    run_hook "on-enter" "echo {ssh_key} > '$outfile'" "1234" "/my/key" "myvm" "/work" "test-uuid"
     [ "$(cat "$outfile")" = "/my/key" ]
 }
 
 @test "run_hook: expands {container} placeholder" {
     local outfile="$TMPDIR/out"
-    run_hook "on-enter" "echo {container} > '$outfile'" "1234" "/key" "test-vm" "/work"
+    run_hook "on-enter" "echo {container} > '$outfile'" "1234" "/key" "test-vm" "/work" "test-uuid"
     [ "$(cat "$outfile")" = "test-vm" ]
 }
 
 @test "run_hook: expands {workdir} placeholder" {
     local outfile="$TMPDIR/out"
-    run_hook "on-enter" "echo {workdir} > '$outfile'" "1234" "/key" "myvm" "/my/workdir"
+    run_hook "on-enter" "echo {workdir} > '$outfile'" "1234" "/key" "myvm" "/my/workdir" "test-uuid"
     [ "$(cat "$outfile")" = "/my/workdir" ]
+}
+
+@test "run_hook: expands {uuid} placeholder" {
+    local outfile="$TMPDIR/out"
+    run_hook "on-enter" "echo {uuid} > '$outfile'" "1234" "/key" "myvm" "/work" "abc-123-def"
+    [ "$(cat "$outfile")" = "abc-123-def" ]
 }
 
 @test "run_hook: expands all placeholders in one command" {
     local outfile="$TMPDIR/out"
     run_hook "on-enter" \
-        "echo {ssh_port} {ssh_key} {container} {workdir} > '$outfile'" \
-        "9999" "/ssh/key" "vm1" "/home/user/code"
-    [ "$(cat "$outfile")" = "9999 /ssh/key vm1 /home/user/code" ]
+        "echo {ssh_port} {ssh_key} {container} {workdir} {uuid} > '$outfile'" \
+        "9999" "/ssh/key" "vm1" "/home/user/code" "my-uuid"
+    [ "$(cat "$outfile")" = "9999 /ssh/key vm1 /home/user/code my-uuid" ]
 }
 
 @test "run_hook: exports SCHUPFN_SSH_PORT" {
     local outfile="$TMPDIR/out"
-    run_hook "on-enter" 'echo $SCHUPFN_SSH_PORT > '"'$outfile'" "4242" "/key" "myvm" "/work"
+    run_hook "on-enter" 'echo $SCHUPFN_SSH_PORT > '"'$outfile'" "4242" "/key" "myvm" "/work" "test-uuid"
     [ "$(cat "$outfile")" = "4242" ]
 }
 
 @test "run_hook: exports SCHUPFN_SSH_KEY" {
     local outfile="$TMPDIR/out"
-    run_hook "on-enter" 'echo $SCHUPFN_SSH_KEY > '"'$outfile'" "1234" "/path/to/key" "myvm" "/work"
+    run_hook "on-enter" 'echo $SCHUPFN_SSH_KEY > '"'$outfile'" "1234" "/path/to/key" "myvm" "/work" "test-uuid"
     [ "$(cat "$outfile")" = "/path/to/key" ]
 }
 
 @test "run_hook: exports SCHUPFN_CONTAINER" {
     local outfile="$TMPDIR/out"
-    run_hook "on-enter" 'echo $SCHUPFN_CONTAINER > '"'$outfile'" "1234" "/key" "my-vm" "/work"
+    run_hook "on-enter" 'echo $SCHUPFN_CONTAINER > '"'$outfile'" "1234" "/key" "my-vm" "/work" "test-uuid"
     [ "$(cat "$outfile")" = "my-vm" ]
 }
 
 @test "run_hook: exports SCHUPFN_WORKDIR" {
     local outfile="$TMPDIR/out"
-    run_hook "on-enter" 'echo $SCHUPFN_WORKDIR > '"'$outfile'" "1234" "/key" "myvm" "/the/workdir"
+    run_hook "on-enter" 'echo $SCHUPFN_WORKDIR > '"'$outfile'" "1234" "/key" "myvm" "/the/workdir" "test-uuid"
     [ "$(cat "$outfile")" = "/the/workdir" ]
 }
 
+@test "run_hook: exports SCHUPFN_UUID" {
+    local outfile="$TMPDIR/out"
+    run_hook "on-enter" 'echo $SCHUPFN_UUID > '"'$outfile'" "1234" "/key" "myvm" "/work" "abc-123-def"
+    [ "$(cat "$outfile")" = "abc-123-def" ]
+}
+
 @test "run_hook: warns on non-zero exit" {
-    run_hook "on-exit" "false" "1234" "/key" "myvm" "/work"
+    run_hook "on-exit" "false" "1234" "/key" "myvm" "/work" "test-uuid"
     assert_warned "on-exit hook exited with status"
 }
 
 @test "run_hook: no warning on success" {
-    run_hook "on-enter" "true" "1234" "/key" "myvm" "/work"
+    run_hook "on-enter" "true" "1234" "/key" "myvm" "/work" "test-uuid"
     assert_no_warnings
 }
 
 @test "run_hook: command without placeholders runs as-is" {
     local outfile="$TMPDIR/out"
-    run_hook "on-enter" "echo hello > '$outfile'" "1234" "/key" "myvm" "/work"
+    run_hook "on-enter" "echo hello > '$outfile'" "1234" "/key" "myvm" "/work" "test-uuid"
     [ "$(cat "$outfile")" = "hello" ]
 }
 
 @test "run_hook: env vars do not leak into parent shell" {
-    unset SCHUPFN_SSH_PORT SCHUPFN_SSH_KEY SCHUPFN_CONTAINER SCHUPFN_WORKDIR
-    run_hook "on-enter" "true" "1234" "/key" "myvm" "/work"
+    unset SCHUPFN_SSH_PORT SCHUPFN_SSH_KEY SCHUPFN_CONTAINER SCHUPFN_WORKDIR SCHUPFN_UUID
+    run_hook "on-enter" "true" "1234" "/key" "myvm" "/work" "test-uuid"
     [ -z "${SCHUPFN_SSH_PORT:-}" ]
     [ -z "${SCHUPFN_SSH_KEY:-}" ]
     [ -z "${SCHUPFN_CONTAINER:-}" ]
     [ -z "${SCHUPFN_WORKDIR:-}" ]
+    [ -z "${SCHUPFN_UUID:-}" ]
+}
+
+@test "run_hook: uuid parameter is optional for backward compat" {
+    local outfile="$TMPDIR/out"
+    run_hook "on-enter" "echo ok > '$outfile'" "1234" "/key" "myvm" "/work"
+    [ "$(cat "$outfile")" = "ok" ]
+    assert_no_warnings
 }
 
 # ── load_config: hook fields ────────────────────────────────────────────────
